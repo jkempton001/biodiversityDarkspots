@@ -94,49 +94,118 @@ make_region_poly <- function() {
 #=============================== CORE BUILDING BLOCKS =========================#
 
 # 1) Download: by regions for a taxonKey
-occ_download_by_regions <- function(taxon_key, scope_names, format = "DWCA",
-                                    basis_of_record = VALID_BOR) {
+occ_download_by_regions <- function(
+    taxon_key,
+    scope_names,
+    format = "DWCA",
+    basis_of_record = VALID_BOR,     # if you added BOR param earlier
+    max_concurrent = 3,
+    poll_every_sec = 15,
+    retry_max = 6
+) {
   stopifnot(all(scope_names %in% names(REGIONS)))
-  
-  # Validate BOR values early (defensive)
   if (!all(toupper(basis_of_record) %in% VALID_BOR)) {
     bad <- setdiff(toupper(basis_of_record), VALID_BOR)
     stop("Unknown basis_of_record value(s): ", paste(bad, collapse = ", "))
   }
   
-  keys <- purrr::map(scope_names, function(nm){
-    region_codes <- REGIONS[[nm]]
+  # helper to launch one download, with retry if GBIF says "too many simultaneous"
+  launch_one <- function(region_name) {
+    region_codes <- REGIONS[[region_name]]
     
     preds <- list(
       pred("taxonKey", taxon_key),
-      # Use requested BOR filter (single value -> pred, multiple -> pred_in)
-      if (length(basis_of_record) == 1) {
-        pred("basisOfRecord", toupper(basis_of_record))
-      } else {
-        pred_in("basisOfRecord", toupper(basis_of_record))
-      },
+      if (length(basis_of_record) == 1) pred("basisOfRecord", toupper(basis_of_record))
+      else pred_in("basisOfRecord", toupper(basis_of_record)),
       pred("hasGeospatialIssue", FALSE),
       pred("hasCoordinate", TRUE),
       pred("occurrenceStatus", "PRESENT")
     )
     
-    # region predicate
     if (length(region_codes) == 1) {
       preds <- append(preds, list(pred("gadm", region_codes)), after = 1)
     } else {
       preds <- append(preds, list(pred_in("gadm", region_codes)), after = 1)
     }
     
-    do.call(
-      occ_download,
-      c(preds, format = format, user = GBIF_USER, pwd = GBIF_PWD, email = GBIF_EMAIL)
-    )
-  })
+    attempt <- 1
+    repeat {
+      key <- tryCatch({
+        do.call(
+          occ_download,
+          c(preds, format = format, user = GBIF_USER, pwd = GBIF_PWD, email = GBIF_EMAIL)
+        )
+      }, error = function(e) {
+        msg <- tolower(conditionMessage(e))
+        if (grepl("download limitation is exceeded|too many simultaneous downloads", msg) &&
+            attempt < retry_max) {
+          wait <- poll_every_sec * attempt
+          message("GBIF limit hit starting '", region_name, "'. Retrying in ", wait, "s (attempt ",
+                  attempt + 1, "/", retry_max, ") …")
+          Sys.sleep(wait)
+          return(NULL)  # signal retry
+        }
+        stop(e)
+      })
+      if (!is.null(key)) break
+      attempt <- attempt + 1
+    }
+    message("Started ", region_name, " => ", key)
+    key
+  }
   
-  names(keys) <- scope_names
+  # status helper
+  get_status <- function(key) {
+    meta <- rgbif::occ_download_meta(key)
+    if (is.null(meta$status)) return(NA_character_)
+    meta$status
+  }
+  
+  # queue/active/results
+  queue <- scope_names
+  active <- list()   # region_name -> key
+  results <- list()  # region_name -> key (finished)
+  
   cat("Started downloads for:", paste(scope_names, collapse = ", "),
-      "\nBasis of record filter:", paste(basis_of_record, collapse = ", "), "\n")
-  keys
+      "\nBasis of record filter:", paste(basis_of_record, collapse = ", "),
+      "\nMax concurrent:", max_concurrent, "\n")
+  
+  while (length(queue) > 0 || length(active) > 0) {
+    
+    # fill up to concurrency limit
+    while (length(queue) > 0 && length(active) < max_concurrent) {
+      nm <- queue[[1]]; queue <- queue[-1]
+      key <- launch_one(nm)
+      active[[nm]] <- key
+    }
+    
+    # poll current actives
+    if (length(active) > 0) {
+      statuses <- purrr::imap_chr(active, function(key, nm) {
+        st <- get_status(key)
+        message("  [", nm, "] status: ", st)
+        st
+      })
+      
+      # move finished jobs to results (keep FAILED/KILLED/CANCELLED but warn)
+      finished <- names(statuses)[statuses %in% c("SUCCEEDED","FAILED","KILLED","CANCELLED")]
+      if (length(finished) > 0) {
+        for (nm in finished) {
+          if (statuses[[nm]] != "SUCCEEDED")
+            warning("Download for '", nm, "' ended with status ", statuses[[nm]],
+                    ". Key: ", active[[nm]])
+          results[[nm]] <- active[[nm]]
+          active[[nm]] <- NULL
+        }
+      }
+      
+      # if still have running jobs, wait before next poll
+      if (length(active) > 0) Sys.sleep(poll_every_sec)
+    }
+  }
+  
+  # return keys in the same naming style as before
+  results[scope_names]
 }
 
 # ---- NEW: robust DWCA reader (handles quoted newlines etc.) -------------------
@@ -475,7 +544,9 @@ run_gbif_pipeline <- function(taxon_label,
                               reuse_cleaned = TRUE,
                               cleaned_csv = NULL,
                               basis_of_record = VALID_BOR,
-                              run_suffix = NULL) {
+                              run_suffix = NULL,
+                              max_concurrent = 3,       # NEW
+                              poll_every_sec = 15) {
   date_stamp <- format(Sys.Date(), "%Y%m%d")
   ttl <- stringr::str_to_title(taxon_label)
   borT <- bor_tag(basis_of_record)
@@ -523,7 +594,13 @@ run_gbif_pipeline <- function(taxon_label,
   
   # 1) Download
   if (is.null(download_keys_override)) {
-    dl_keys <- occ_download_by_regions(taxon_key, scope, basis_of_record = basis_of_record)
+    dl_keys <- occ_download_by_regions(
+      taxon_key,
+      scope,
+      basis_of_record = basis_of_record,
+      max_concurrent = max_concurrent,
+      poll_every_sec = poll_every_sec
+    )
   } else {
     dl_keys <- download_keys_override
     stopifnot(all(names(dl_keys) %in% names(REGIONS)))
@@ -701,7 +778,7 @@ plants_res <- run_gbif_pipeline(
   taxon_key   = 7707728,
   scope       = names(plants_keys),
   study_shp_path = "territory_selection.shp",
-  download_keys_override = plants_keys,
+  download_keys_override = NULL,
   reuse_cleaned = FALSE,
   basis_of_record = "PRESERVED_SPECIMEN"
 )
