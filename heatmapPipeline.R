@@ -8,6 +8,20 @@ library(CoordinateCleaner); library(countrycode); library(ggrastr); library(rgbi
 library(magrittr); library(bit64); library(keyring); library(geodata)
 library(stringr); library(tidyr); library(units)
 
+# Basis-of-record
+
+VALID_BOR <- c(
+  "OBSERVATION","MACHINE_OBSERVATION","HUMAN_OBSERVATION",
+  "MATERIAL_SAMPLE","MATERIAL_CITATION","PRESERVED_SPECIMEN","OCCURRENCE"
+)
+
+bor_tag <- function(bor_vec) {
+  if (is.null(bor_vec)) return("BOR-all")                # not used in this proposal, but safe
+  bor_vec <- toupper(bor_vec)
+  if (length(bor_vec) == 1) paste0("BOR-", bor_vec) else "BOR-multi"
+}
+
+
 # ── Credentials ────────────────────────────────────────────────────────────────
 get_gbif_credentials <- function(service_user = "jkempton001") {
   ensure <- function(service_name){
@@ -80,27 +94,48 @@ make_region_poly <- function() {
 #=============================== CORE BUILDING BLOCKS =========================#
 
 # 1) Download: by regions for a taxonKey
-occ_download_by_regions <- function(taxon_key, scope_names, format = "DWCA") {
+occ_download_by_regions <- function(taxon_key, scope_names, format = "DWCA",
+                                    basis_of_record = VALID_BOR) {
   stopifnot(all(scope_names %in% names(REGIONS)))
-  keys <- map(scope_names, function(nm){
+  
+  # Validate BOR values early (defensive)
+  if (!all(toupper(basis_of_record) %in% VALID_BOR)) {
+    bad <- setdiff(toupper(basis_of_record), VALID_BOR)
+    stop("Unknown basis_of_record value(s): ", paste(bad, collapse = ", "))
+  }
+  
+  keys <- purrr::map(scope_names, function(nm){
     region_codes <- REGIONS[[nm]]
+    
     preds <- list(
       pred("taxonKey", taxon_key),
-      pred_in("basisOfRecord", c("OBSERVATION","MACHINE_OBSERVATION","HUMAN_OBSERVATION",
-                                 "MATERIAL_SAMPLE","MATERIAL_CITATION","PRESERVED_SPECIMEN","OCCURRENCE")),
+      # Use requested BOR filter (single value -> pred, multiple -> pred_in)
+      if (length(basis_of_record) == 1) {
+        pred("basisOfRecord", toupper(basis_of_record))
+      } else {
+        pred_in("basisOfRecord", toupper(basis_of_record))
+      },
       pred("hasGeospatialIssue", FALSE),
       pred("hasCoordinate", TRUE),
       pred("occurrenceStatus", "PRESENT")
     )
+    
+    # region predicate
     if (length(region_codes) == 1) {
       preds <- append(preds, list(pred("gadm", region_codes)), after = 1)
     } else {
       preds <- append(preds, list(pred_in("gadm", region_codes)), after = 1)
     }
-    do.call(occ_download, c(preds, format = format, user = GBIF_USER, pwd = GBIF_PWD, email = GBIF_EMAIL))
+    
+    do.call(
+      occ_download,
+      c(preds, format = format, user = GBIF_USER, pwd = GBIF_PWD, email = GBIF_EMAIL)
+    )
   })
+  
   names(keys) <- scope_names
-  cat("Started downloads for:", paste(scope_names, collapse = ", "), "\n")
+  cat("Started downloads for:", paste(scope_names, collapse = ", "),
+      "\nBasis of record filter:", paste(basis_of_record, collapse = ", "), "\n")
   keys
 }
 
@@ -242,13 +277,16 @@ clean_occurrences <- function(df, study_shp_path) {
 }
 
 # 6) Find cleaned data, if it already exists
-find_latest_cleaned_csv <- function(taxon_label) {
-  pat <- paste0("^gbifSEAsia_", stringr::str_to_title(taxon_label), "OccDataCleaned_\\d{8}\\.csv$")
+find_latest_cleaned_csv <- function(taxon_label, suffix = NULL) {
+  base <- paste0("^gbifSEAsia_", stringr::str_to_title(taxon_label), "OccDataCleaned_\\d{8}")
+  if (!is.null(suffix)) base <- paste0(base, "_", stringr::str_replace_all(suffix, "[^A-Za-z0-9_-]", ""))
+  pat <- paste0(base, "\\.csv$")
   files <- list.files(pattern = pat)
   if (length(files) == 0) return(NULL)
   dates <- as.Date(stringr::str_extract(files, "\\d{8}"), "%Y%m%d")
   files[order(dates, decreasing = TRUE)][1]
 }
+
 
 # 7) Grid heatmap (same styling; returns ggplot object and writes SVG)
 make_heatmap <- function(clean_df, out_prefix, region_pack = make_region_poly(), cellsize = 0.5) {
@@ -435,26 +473,28 @@ run_gbif_pipeline <- function(taxon_label,
                               study_shp_path = "territory_selection.shp",
                               download_keys_override = NULL,
                               reuse_cleaned = TRUE,
-                              cleaned_csv = NULL) {
+                              cleaned_csv = NULL,
+                              basis_of_record = VALID_BOR,
+                              run_suffix = NULL) {
   date_stamp <- format(Sys.Date(), "%Y%m%d")
   ttl <- stringr::str_to_title(taxon_label)
-  message("=== ", toupper(taxon_label), " / taxonKey=", taxon_key, " ===")
+  borT <- bor_tag(basis_of_record)
+  suffix <- if (!is.null(run_suffix)) run_suffix else borT
   
-  # ---------------------------------------------------------------------------
-  # 0) If requested, try to reuse an existing CLEANED CSV and skip to plotting
-  # ---------------------------------------------------------------------------
+  message("=== ", toupper(taxon_label), " / taxonKey=", taxon_key,
+          " / ", paste0("BOR=", paste(basis_of_record, collapse=",")), " ===")
+  
+  # 0) Reuse cleaned CSV?
   if (!is.null(cleaned_csv) && file.exists(cleaned_csv)) {
     message("Reusing cleaned occurrences from: ", cleaned_csv)
     clean <- readr::read_csv(cleaned_csv, show_col_types = FALSE)
-    std <- NULL   # not recomputed in reuse path
-    dl_keys <- NULL
+    std <- NULL; dl_keys <- NULL
   } else if (isTRUE(reuse_cleaned)) {
-    latest <- find_latest_cleaned_csv(taxon_label)
+    latest <- find_latest_cleaned_csv(taxon_label, suffix = suffix)  # <-- updated
     if (!is.null(latest)) {
       message("Reusing latest cleaned CSV found in working directory: ", latest)
       clean <- readr::read_csv(latest, show_col_types = FALSE)
-      std <- NULL
-      dl_keys <- NULL
+      std <- NULL; dl_keys <- NULL
     } else {
       clean <- NULL
     }
@@ -462,71 +502,58 @@ run_gbif_pipeline <- function(taxon_label,
     clean <- NULL
   }
   
-  # If we already have 'clean', jump to plotting & density
   if (!is.null(clean)) {
     rp <- make_region_poly()
-    plot_obj <- make_heatmap(clean, out_prefix = paste0(taxon_label, "_digitised_occurrences"), region_pack = rp)
+    plot_obj <- make_heatmap(clean,
+                             out_prefix = paste0(taxon_label, "_digitised_occurrences_", suffix),
+                             region_pack = rp)
     dens <- region_density(clean, region_col = "COUNTRY")
-    dens_out <- paste0(taxon_label, "_occurrence_density_", date_stamp, ".csv")
+    dens_out <- paste0(taxon_label, "_occurrence_density_", date_stamp, "_", suffix, ".csv")
     readr::write_csv(dens, dens_out)
     message("Saved density table: ", dens_out)
     
     return(list(
       download_keys = dl_keys,
-      standardized  = std,
+      standardized  = NULL,
       cleaned       = clean,
       heatmap       = plot_obj,
       density_table = dens
     ))
   }
   
-  # ---------------------------------------------------------------------------
-  # 1) Download (or reuse provided keys)  — unchanged
-  # ---------------------------------------------------------------------------
+  # 1) Download
   if (is.null(download_keys_override)) {
-    dl_keys <- occ_download_by_regions(taxon_key, scope)
+    dl_keys <- occ_download_by_regions(taxon_key, scope, basis_of_record = basis_of_record)
   } else {
     dl_keys <- download_keys_override
     stopifnot(all(names(dl_keys) %in% names(REGIONS)))
     message("Using provided download keys (skipping new downloads).")
   }
   
-  # ---------------------------------------------------------------------------
-  # 2) Import & bind  — unchanged
-  # ---------------------------------------------------------------------------
+  # 2) Import & bind
   raw <- import_and_bind(dl_keys)
   
-  # ---------------------------------------------------------------------------
-  # 3) Standardize essential columns
-  # ---------------------------------------------------------------------------
+  # 3) Standardize
   std <- standardize_for_modeling(raw)
-  
-  # Save the STANDARDIZED (uncleaned) dataset   <<<< rename to Standardized
-  std_out <- paste0("gbifSEAsia_", ttl, "OccDataStandardized_", date_stamp, ".csv")
+  std_out <- paste0("gbifSEAsia_", ttl, "OccDataStandardized_", date_stamp, "_", suffix, ".csv")
   readr::write_csv(std, std_out)
   message("Saved standardized table: ", std_out)
   
-  # ---------------------------------------------------------------------------
-  # 4) Clean with CoordinateCleaner + shapefile clip + taxonomic filter
-  # ---------------------------------------------------------------------------
+  # 4) Clean
   clean <- clean_occurrences(std, study_shp_path)
-  
-  # Save the CLEANED dataset
-  clean_out <- paste0("gbifSEAsia_", ttl, "OccDataCleaned_", date_stamp, ".csv")
+  clean_out <- paste0("gbifSEAsia_", ttl, "OccDataCleaned_", date_stamp, "_", suffix, ".csv")
   readr::write_csv(clean, clean_out)
   message("Saved cleaned table: ", clean_out)
   
-  # ---------------------------------------------------------------------------
-  # 5) Plot heatmap & save SVG
-  # ---------------------------------------------------------------------------
+  # 5) Plot
   rp <- make_region_poly()
-  plot_obj <- make_heatmap(clean, out_prefix = paste0(taxon_label, "_digitised_occurrences"), region_pack = rp)
+  plot_obj <- make_heatmap(clean,
+                           out_prefix = paste0(taxon_label, "_digitised_occurrences_", suffix),
+                           region_pack = rp)
   
-  # ---------------------------------------------------------------------------
-  # 6) Density table
-  # ---------------------------------------------------------------------------
+  # 6) Density
   dens <- region_density(clean, region_col = "COUNTRY")
-  dens_out <- paste0(taxon_label, "_occurrence_density_", date_stamp, ".csv")
+  dens_out <- paste0(taxon_label, "_occurrence_density_", date_stamp, "_", suffix, ".csv")
   readr::write_csv(dens, dens_out)
   message("Saved density table: ", dens_out)
   
@@ -668,11 +695,13 @@ squamates_res <- run_gbif_pipeline(
   reuse_cleaned = FALSE        # default; can even omit
 )
 
+
 plants_res <- run_gbif_pipeline(
   taxon_label = "tracheophyta",
   taxon_key   = 7707728,
   scope       = names(plants_keys),
   study_shp_path = "territory_selection.shp",
   download_keys_override = plants_keys,
-  reuse_cleaned = FALSE        # default; can even omit
+  reuse_cleaned = FALSE,
+  basis_of_record = "PRESERVED_SPECIMEN"
 )
