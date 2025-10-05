@@ -141,41 +141,100 @@ codes_for_scope <- function(scope_names) {
 # - "IDN.22_1" style => GADM level 1 feature
 # - "PNG" style (3-letter ISO) => admin0 country polygon
 geom_from_code <- function(code, gadm_cache = new.env(parent = emptyenv())) {
-  # Country-only code?
-  if (grepl("^[A-Z]{3}$", code)) {
-    sf::st_make_valid(
-      rnaturalearth::ne_countries(iso_a3 = code, returnclass = "sf")
-    )
+  # Returns an sf polygon feature in EPSG:4326 for either:
+  # - ISO3 country code (e.g., "PNG"), or
+  # - GADM L1 code (e.g., "IDN.22_1")
+  
+  out <- if (grepl("^[A-Z]{3}$", code)) {
+    # ---- ISO3 COUNTRY BRANCH ----
+    w <- rnaturalearth::ne_countries(scale = "medium", returnclass = "sf")
+    code <- toupper(code)
+    
+    # pick the first ISO3-like column that exists
+    iso_cols <- intersect(c("iso_a3", "adm0_a3", "gu_a3"), names(w))
+    if (length(iso_cols) == 0) stop("Could not find any ISO3 column in Natural Earth data.")
+    iso_col <- iso_cols[1]
+    
+    cand <- w[toupper(w[[iso_col]]) == code, , drop = FALSE]
+    if (nrow(cand) == 0) stop("Could not find country with ISO3=", code)
+    cand
+    
   } else if (grepl("^[A-Z]{3}\\.\\d+_\\d+$", code)) {
+    # ---- GADM CODE BRANCH (e.g., "IDN.22_1") ----
     iso3  <- sub("\\..*$", "", code)
     level <- as.integer(sub(".*_(\\d+)$", "\\1", code))
     key   <- paste0(iso3, "_L", level)
     
-    # cache country-level shapefile per (iso, level)
-    gadm_sf <- if (!exists(key, envir = gadm_cache)) {
-      x <- geodata::gadm(country = iso3, level = level, path = tempdir(), format = "sf")
+    gadm_obj <- if (!exists(key, envir = gadm_cache)) {
+      x <- geodata::gadm(country = iso3, level = level, path = tempdir())
       assign(key, x, envir = gadm_cache); x
     } else {
       get(key, envir = gadm_cache)
     }
     
+    # coerce SpatVector -> sf if needed
+    if (inherits(gadm_obj, "SpatVector")) gadm_obj <- sf::st_as_sf(gadm_obj)
+    
     gid_col <- paste0("GID_", level)
-    if (!gid_col %in% names(gadm_sf)) {
+    if (!gid_col %in% names(gadm_obj))
       stop("GADM table for ", iso3, " level ", level, " lacks column ", gid_col)
-    }
-    out <- gadm_sf[gadm_sf[[gid_col]] == code, ]
-    if (nrow(out) == 0) stop("Could not find GADM feature for code: ", code)
-    sf::st_make_valid(out)
+    
+    sel <- gadm_obj[gadm_obj[[gid_col]] == code, ]
+    if (nrow(sel) == 0) stop("Could not find GADM feature for code: ", code)
+    sel
+    
   } else {
     stop("Unrecognised region code format: ", code)
   }
+  
+  # ---- Normalise to valid EPSG:4326 sf ----
+  out <- sf::st_make_valid(out)
+  if (is.na(sf::st_crs(out))) sf::st_crs(out) <- sf::st_crs(4326)
+  if (!identical(sf::st_crs(out)$epsg, 4326L)) out <- sf::st_transform(out, 4326)
+  
+  out
 }
 
+
+
 # Union a set of codes (IDN.22_1, PNG, etc.) into one geometry
+# ---- robust: union a set of codes into one MULTIPOLYGON sf in EPSG:4326 ----
 region_geom_from_codes <- function(codes) {
-  parts <- purrr::map(codes, geom_from_code)
-  sf::st_make_valid(sf::st_union(do.call(rbind, parts)))
+  stopifnot(length(codes) > 0)
+  
+  # standardise one sf to 2D MULTIPOLYGON in EPSG:4326 and return geometry (sfc)
+  standardise <- function(sfobj) {
+    obj <- sf::st_make_valid(sfobj)
+    # enforce CRS
+    if (is.na(sf::st_crs(obj))) sf::st_crs(obj) <- sf::st_crs(4326)
+    if (!identical(sf::st_crs(obj)$epsg, 4326L)) obj <- sf::st_transform(obj, 4326)
+    
+    # drop non-area bits & force 2D MULTIPOLYGON
+    geom <- sf::st_geometry(obj)
+    geom <- sf::st_zm(geom, drop = TRUE, what = "ZM")                       # drop Z/M
+    geom <- sf::st_collection_extract(geom, "POLYGON", warn = FALSE)        # only polygons
+    geom <- sf::st_cast(geom, "MULTIPOLYGON", warn = FALSE)                 # unify types
+    geom
+  }
+  
+  # get each code’s geometry (sfc)
+  parts <- lapply(codes, function(cd) standardise(geom_from_code(cd)))
+  
+  # guard against empties
+  lens <- vapply(parts, length, integer(1))
+  if (any(lens == 0))
+    stop("At least one code resolved to an empty geometry: ",
+         paste(codes[which(lens==0)], collapse = ", "))
+  
+  # concatenate sfc safely and union
+  combined <- do.call(c, parts)                      # c.sfc
+  sf::st_crs(combined) <- sf::st_crs(4326)           # ensure CRS sticks
+  unioned  <- sf::st_union(sf::st_combine(combined)) # dissolve internal borders
+  
+  # wrap back into sf
+  sf::st_as_sf(data.frame(id = 1), geometry = sf::st_sfc(unioned, crs = 4326))
 }
+
 
 
 #=============================== CORE BUILDING BLOCKS =========================#
@@ -717,14 +776,24 @@ run_gbif_pipeline <- function(taxon_label,
   # 5) Plot
   map_scope_eff <- map_scope %||% scope
   map_codes <- codes_for_scope(map_scope_eff)
-  reg_geom  <- tryCatch(region_geom_from_codes(map_codes),
-                        error = function(e) { message("Falling back to default map window: ", e$message); NULL })
+  message("Map codes: ", paste(map_codes, collapse = ", "))
+  
+  # Build unioned map geometry (will error loudly if something is wrong)
+  reg_geom <- region_geom_from_codes(map_codes)
+  
+  # Quick sanity: print bbox we’re about to use
+  message("Union bbox (pre-margin): ",
+          paste(round(unname(sf::st_bbox(reg_geom)), 4), collapse = ", "))
   
   rp <- make_region_poly(
-    region_geom   = reg_geom,
-    region_bbox   = map_bbox,
+    region_geom    = reg_geom,
+    region_bbox    = map_bbox,        # normally NULL so bbox derives from reg_geom
     map_margin_deg = map_margin_deg
   )
+  
+  message("Plot bbox (post-margin): ",
+          paste(round(unname(rp$bbox), 4), collapse = ", "))
+  
   plot_obj <- make_heatmap(clean,
                            out_prefix = paste0(taxon_label, "_digitised_occurrences_", suffix),
                            region_pack = rp)
@@ -835,15 +904,21 @@ plants_keys <- list(
 
 
 
-# Frogs (Anura = 952)
 frog_res <- run_gbif_pipeline(
   taxon_label = "anura",
   taxon_key   = 952,
-  scope       = names(frog_keys),
+  scope       = names(frog_keys),                # data scope (unchanged)
   study_shp_path = "territory_selection.shp",
   download_keys_override = frog_keys,
-  reuse_cleaned = TRUE
+  reuse_cleaned = FALSE,
+  basis_of_record =  c(
+    "OBSERVATION","MACHINE_OBSERVATION","HUMAN_OBSERVATION",
+    "MATERIAL_SAMPLE","MATERIAL_CITATION","PRESERVED_SPECIMEN","OCCURRENCE"
+  ),
+  map_scope    = c("papua_barat","papua","png"), 
+  map_margin_deg = 0.25
 )
+
 
 
 mammal_res <- run_gbif_pipeline(
