@@ -75,21 +75,108 @@ REGION_META <- list(
 
 # ── Plot region (same window you used) ────────────────────────────────────────
 
-make_region_poly <- function() {
+make_region_poly <- function(
+    region_geom = NULL,         # <- union of polygons (sf) to define the map window
+    region_bbox = NULL,         # <- alternatively, pass an explicit bbox (named vector)
+    map_margin_deg = c(0.5, 0.5, 0.5, 0.5)  # c(left, right, bottom, top) padding (deg)
+) {
   world <- rnaturalearth::ne_countries(scale = "medium", returnclass = "sf")
   malaysia <- rnaturalearth::ne_countries(country = "Malaysia", returnclass = "sf")
-  east_my <- st_crop(malaysia, c(xmin=108, xmax=131, ymin=-7, ymax=8))
-  keep <- world |> filter(name %in% c("Indonesia","Brunei","Philippines","Papua New Guinea","Timor-Leste"))
-  region_keep <- bind_rows(keep, east_my) |> st_make_valid() |> st_union()
-  bbox <- st_bbox(c(xmin = 95, xmax = 156, ymin = -10.3, ymax = 22), crs = st_crs(world))
-  regionPoly <- st_crop(region_keep, bbox) |> st_make_valid() |> st_as_sf()
-  borders <- ne_download(scale="large", type="admin_0_boundary_lines_land", category="cultural", returnclass="sf") |>
-    st_make_valid()
-  bbox_sfc <- st_as_sfc(bbox)
-  borders_clip <- suppressWarnings(st_intersection(borders, bbox_sfc))
-  borders_clip <- borders_clip[st_intersects(borders_clip, regionPoly, sparse = FALSE), ]
-  list(regionPoly = st_make_valid(regionPoly), borders_clip = borders_clip, bbox = bbox)
+  east_my <- sf::st_crop(malaysia, c(xmin = 108, xmax = 131, ymin = -7, ymax = 8))
+  
+  # Fallback: original “Indo-Pacific” selection if no geom/bbox was provided
+  default_keep <- world |>
+    dplyr::filter(name %in% c("Indonesia","Brunei","Philippines","Papua New Guinea","Timor-Leste")) |>
+    dplyr::bind_rows(east_my) |>
+    sf::st_make_valid() |>
+    sf::st_union()
+  
+  # Determine the region (land) polygon we’ll display
+  base_region <- sf::st_make_valid(region_geom %||% default_keep)
+  
+  # Determine bbox: either from user, or from the region_geom/default_keep
+  if (is.null(region_bbox)) {
+    bb <- sf::st_bbox(base_region)
+  } else {
+    stopifnot(all(c("xmin","xmax","ymin","ymax") %in% names(region_bbox)))
+    bb <- region_bbox
+  }
+  
+  # Apply margin (degrees)
+  if (length(map_margin_deg) == 1) map_margin_deg <- rep(map_margin_deg, 4)
+  bb["xmin"] <- bb["xmin"] - map_margin_deg[1]
+  bb["xmax"] <- bb["xmax"] + map_margin_deg[2]
+  bb["ymin"] <- bb["ymin"] - map_margin_deg[3]
+  bb["ymax"] <- bb["ymax"] + map_margin_deg[4]
+  
+  # Clip region to that bbox
+  bbox_sfc <- sf::st_as_sfc(bb)
+  regionPoly <- suppressWarnings(sf::st_intersection(base_region, bbox_sfc)) |>
+    sf::st_make_valid() |>
+    sf::st_as_sf()
+  
+  # Boundary lines, clipped and filtered to the plotting area
+  borders <- rnaturalearth::ne_download(
+    scale = "large", type = "admin_0_boundary_lines_land",
+    category = "cultural", returnclass = "sf"
+  ) |> sf::st_make_valid()
+  
+  borders_clip <- suppressWarnings(sf::st_intersection(borders, bbox_sfc))
+  borders_clip <- borders_clip[sf::st_intersects(borders_clip, regionPoly, sparse = FALSE), ]
+  
+  list(regionPoly = regionPoly, borders_clip = borders_clip, bbox = bb)
 }
+# ---------- NEW: utils to construct a region geometry from REGIONS codes -----
+
+# Safe null-coalescing helper
+`%||%` <- function(x, y) if (is.null(x)) y else x
+
+# Pull the GADM/ISO3 codes for a set of scope names (REGIONS entries)
+codes_for_scope <- function(scope_names) {
+  stopifnot(all(scope_names %in% names(REGIONS)))
+  unlist(REGIONS[scope_names], use.names = FALSE)
+}
+
+# Given a single code, return an sf polygon
+# - "IDN.22_1" style => GADM level 1 feature
+# - "PNG" style (3-letter ISO) => admin0 country polygon
+geom_from_code <- function(code, gadm_cache = new.env(parent = emptyenv())) {
+  # Country-only code?
+  if (grepl("^[A-Z]{3}$", code)) {
+    sf::st_make_valid(
+      rnaturalearth::ne_countries(iso_a3 = code, returnclass = "sf")
+    )
+  } else if (grepl("^[A-Z]{3}\\.\\d+_\\d+$", code)) {
+    iso3  <- sub("\\..*$", "", code)
+    level <- as.integer(sub(".*_(\\d+)$", "\\1", code))
+    key   <- paste0(iso3, "_L", level)
+    
+    # cache country-level shapefile per (iso, level)
+    gadm_sf <- if (!exists(key, envir = gadm_cache)) {
+      x <- geodata::gadm(country = iso3, level = level, path = tempdir(), format = "sf")
+      assign(key, x, envir = gadm_cache); x
+    } else {
+      get(key, envir = gadm_cache)
+    }
+    
+    gid_col <- paste0("GID_", level)
+    if (!gid_col %in% names(gadm_sf)) {
+      stop("GADM table for ", iso3, " level ", level, " lacks column ", gid_col)
+    }
+    out <- gadm_sf[gadm_sf[[gid_col]] == code, ]
+    if (nrow(out) == 0) stop("Could not find GADM feature for code: ", code)
+    sf::st_make_valid(out)
+  } else {
+    stop("Unrecognised region code format: ", code)
+  }
+}
+
+# Union a set of codes (IDN.22_1, PNG, etc.) into one geometry
+region_geom_from_codes <- function(codes) {
+  parts <- purrr::map(codes, geom_from_code)
+  sf::st_make_valid(sf::st_union(do.call(rbind, parts)))
+}
+
 
 #=============================== CORE BUILDING BLOCKS =========================#
 
@@ -100,7 +187,7 @@ occ_download_by_regions <- function(
     format = "DWCA",
     basis_of_record = VALID_BOR,     # if you added BOR param earlier
     max_concurrent = 3,
-    poll_every_sec = 15,
+    poll_every_sec = 120,
     retry_max = 6
 ) {
   stopifnot(all(scope_names %in% names(REGIONS)))
@@ -545,8 +632,13 @@ run_gbif_pipeline <- function(taxon_label,
                               cleaned_csv = NULL,
                               basis_of_record = VALID_BOR,
                               run_suffix = NULL,
-                              max_concurrent = 3,       # NEW
-                              poll_every_sec = 15) {
+                              max_concurrent = 3,
+                              poll_every_sec = 15,
+                              # NEW: mapping extent controls
+                              map_scope = NULL,           # vector of names from REGIONS to define map extent
+                              map_bbox = NULL,            # explicit bbox override (named c(xmin,xmax,ymin,ymax))
+                              map_margin_deg = 0.5)     # padding for the bbox
+  {
   date_stamp <- format(Sys.Date(), "%Y%m%d")
   ttl <- stringr::str_to_title(taxon_label)
   borT <- bor_tag(basis_of_record)
@@ -623,7 +715,16 @@ run_gbif_pipeline <- function(taxon_label,
   message("Saved cleaned table: ", clean_out)
   
   # 5) Plot
-  rp <- make_region_poly()
+  map_scope_eff <- map_scope %||% scope
+  map_codes <- codes_for_scope(map_scope_eff)
+  reg_geom  <- tryCatch(region_geom_from_codes(map_codes),
+                        error = function(e) { message("Falling back to default map window: ", e$message); NULL })
+  
+  rp <- make_region_poly(
+    region_geom   = reg_geom,
+    region_bbox   = map_bbox,
+    map_margin_deg = map_margin_deg
+  )
   plot_obj <- make_heatmap(clean,
                            out_prefix = paste0(taxon_label, "_digitised_occurrences_", suffix),
                            region_pack = rp)
