@@ -78,22 +78,42 @@ make_shp_tag <- function(shp_path) {
 
 
 
+
 # ── Plot region (same window you used) ────────────────────────────────────────
 
-make_region_poly <- function() {
+# Accepts:
+# - numeric vector c(xmin, xmax, ymin, ymax), or
+# - named list/vector with names xmin/xmax/ymin/ymax, or
+# - NULL to use your current default
+make_region_poly <- function(bbox = NULL) {
   world <- rnaturalearth::ne_countries(scale = "medium", returnclass = "sf")
   malaysia <- rnaturalearth::ne_countries(country = "Malaysia", returnclass = "sf")
   east_my <- st_crop(malaysia, c(xmin=108, xmax=131, ymin=-7, ymax=8))
-  keep <- world |> filter(name %in% c("Indonesia","Brunei","Philippines","Papua New Guinea","Timor-Leste"))
-  region_keep <- bind_rows(keep, east_my) |> st_make_valid() |> st_union()
-  bbox <- st_bbox(c(xmin = 95, xmax = 156, ymin = -10.3, ymax = 22), crs = st_crs(world))
-  regionPoly <- st_crop(region_keep, bbox) |> st_make_valid() |> st_as_sf()
-  borders <- ne_download(scale="large", type="admin_0_boundary_lines_land", category="cultural", returnclass="sf") |>
+  keep <- world |> dplyr::filter(name %in% c("Indonesia","Brunei","Philippines","Papua New Guinea","Timor-Leste"))
+  region_keep <- dplyr::bind_rows(keep, east_my) |> st_make_valid() |> st_union()
+  
+  # --- NEW: normalize bbox input ---
+  if (is.null(bbox)) {
+    bb <- sf::st_bbox(c(xmin = 95, xmax = 156, ymin = -10.3, ymax = 22), crs = sf::st_crs(world))
+  } else {
+    # support numeric c(xmin, xmax, ymin, ymax) or named
+    if (is.numeric(bbox) && length(bbox) == 4 && is.null(names(bbox))) {
+      names(bbox) <- c("xmin","xmax","ymin","ymax")
+    }
+    stopifnot(all(c("xmin","xmax","ymin","ymax") %in% names(bbox)))
+    bb <- sf::st_bbox(c(xmin = bbox[["xmin"]], xmax = bbox[["xmax"]],
+                        ymin = bbox[["ymin"]], ymax = bbox[["ymax"]]),
+                      crs = sf::st_crs(world))
+  }
+  
+  regionPoly <- st_crop(region_keep, bb) |> st_make_valid() |> st_as_sf()
+  borders <- rnaturalearth::ne_download(scale="large", type="admin_0_boundary_lines_land",
+                                        category="cultural", returnclass="sf") |>
     st_make_valid()
-  bbox_sfc <- st_as_sfc(bbox)
-  borders_clip <- suppressWarnings(st_intersection(borders, bbox_sfc))
-  borders_clip <- borders_clip[st_intersects(borders_clip, regionPoly, sparse = FALSE), ]
-  list(regionPoly = st_make_valid(regionPoly), borders_clip = borders_clip, bbox = bbox)
+  bbox_sfc <- sf::st_as_sfc(bb)
+  borders_clip <- suppressWarnings(sf::st_intersection(borders, bbox_sfc))
+  borders_clip <- borders_clip[sf::st_intersects(borders_clip, regionPoly, sparse = FALSE), ]
+  list(regionPoly = st_make_valid(regionPoly), borders_clip = borders_clip, bbox = bb)
 }
 
 #=============================== CORE BUILDING BLOCKS =========================#
@@ -465,96 +485,96 @@ run_gbif_pipeline <- function(taxon_label,
                               download_keys_override = NULL,
                               reuse_cleaned = TRUE,
                               cleaned_csv = NULL,
-                              basis_filter = NULL) {   # basis_filter from your previous edit
+                              basis_filter = NULL,
+                              bbox = NULL,                 # << NEW
+                              lon_lim = NULL,              # << NEW (c(min_lon, max_lon))
+                              lat_lim = NULL) {            # << NEW (c(min_lat, max_lat))
   date_stamp <- format(Sys.Date(), "%Y%m%d")
   ttl <- stringr::str_to_title(taxon_label)
-  bor_tag <- make_bor_tag(basis_filter)              # existing helper from your last step
-  shp_tag <- make_shp_tag(study_shp_path)            # << NEW
+  bor_tag <- make_bor_tag(basis_filter)
+  shp_tag <- make_shp_tag(study_shp_path)
+  
+  # --- NEW: build a bbox if user gave lon/lat limits
+  user_bbox <- NULL
+  if (!is.null(bbox)) {
+    # allow unnamed numeric vector
+    if (is.numeric(bbox) && length(bbox) == 4 && is.null(names(bbox))) {
+      names(bbox) <- c("xmin","xmax","ymin","ymax")
+    }
+    user_bbox <- bbox
+  } else if (!is.null(lon_lim) && !is.null(lat_lim)) {
+    stopifnot(length(lon_lim) == 2, length(lat_lim) == 2)
+    user_bbox <- c(xmin = min(lon_lim), xmax = max(lon_lim),
+                   ymin = min(lat_lim), ymax = max(lat_lim))
+  }
   message("=== ", toupper(taxon_label), " / taxonKey=", taxon_key,
-          " / ", bor_tag, " / ", shp_tag, " ===")
+          " / ", bor_tag, " / ", shp_tag,
+          if (!is.null(user_bbox)) paste0(" / BBOX=[", paste(user_bbox, collapse=", "), "]") else "")
   
-  # 0) Reuse cleaned?
+  # ---------------- Reuse-cleaned branch (unchanged, but pass region_pack) ---
   if (!is.null(cleaned_csv) && file.exists(cleaned_csv)) {
-    message("Reusing cleaned occurrences from: ", cleaned_csv)
     clean <- readr::read_csv(cleaned_csv, show_col_types = FALSE)
-    std <- NULL; dl_keys <- NULL
-  } else if (isTRUE(reuse_cleaned)) {
-    latest <- find_latest_cleaned_csv(taxon_label, bor_tag = bor_tag, shp_tag = shp_tag)  # << NEW
-    if (!is.null(latest)) {
-      message("Reusing latest cleaned CSV found: ", latest)
-      clean <- readr::read_csv(latest, show_col_types = FALSE)
-      std <- NULL; dl_keys <- NULL
-    } else clean <- NULL
-  } else clean <- NULL
-  
-  if (!is.null(clean)) {
-    rp <- make_region_poly()
+    rp <- make_region_poly(bbox = user_bbox)   # << NEW
     plot_obj <- make_heatmap(
       clean,
-      out_prefix = paste0(taxon_label, "_", bor_tag, "_", shp_tag, "_digitised_occurrences"),  # << NEW
+      out_prefix = paste0(taxon_label, "_", bor_tag, "_", shp_tag, "_digitised_occurrences"),
       region_pack = rp
     )
     dens <- region_density(clean, region_col = "COUNTRY")
-    dens_out <- paste0(taxon_label, "_occurrence_density_", bor_tag, "_", shp_tag, "_", date_stamp, ".csv")  # << NEW
+    dens_out <- paste0(taxon_label, "_occurrence_density_", bor_tag, "_", shp_tag, "_", date_stamp, ".csv")
     readr::write_csv(dens, dens_out)
-    message("Saved density table: ", dens_out)
     return(list(download_keys = NULL, standardized = NULL, cleaned = clean,
                 heatmap = plot_obj, density_table = dens))
+  } else if (isTRUE(reuse_cleaned)) {
+    latest <- find_latest_cleaned_csv(taxon_label, bor_tag = bor_tag, shp_tag = shp_tag)
+    if (!is.null(latest)) {
+      clean <- readr::read_csv(latest, show_col_types = FALSE)
+      rp <- make_region_poly(bbox = user_bbox)  # << NEW
+      plot_obj <- make_heatmap(
+        clean,
+        out_prefix = paste0(taxon_label, "_", bor_tag, "_", shp_tag, "_digitised_occurrences"),
+        region_pack = rp
+      )
+      dens <- region_density(clean, region_col = "COUNTRY")
+      dens_out <- paste0(taxon_label, "_occurrence_density_", bor_tag, "_", shp_tag, "_", date_stamp, ".csv")
+      readr::write_csv(dens, dens_out)
+      return(list(download_keys = NULL, standardized = NULL, cleaned = clean,
+                  heatmap = plot_obj, density_table = dens))
+    }
   }
   
-  # 1) Download (unchanged – still uses your pre-made keys if provided)
+  # ---------------- Download/import/clean as before --------------------------
   if (is.null(download_keys_override)) {
-    dl_keys <- occ_download_by_regions(taxon_key, scope)   # unchanged
+    dl_keys <- occ_download_by_regions(taxon_key, scope)  # unchanged
   } else {
     dl_keys <- download_keys_override
     stopifnot(all(names(dl_keys) %in% names(REGIONS)))
-    message("Using provided download keys (skipping new downloads).")
   }
-  
-  # 2) Import & bind
   raw <- import_and_bind(dl_keys)
-  
-  # 3) Standardize
   std <- standardize_for_modeling(raw)
-  
-  # 3b) Filter by basisOfRecord *post-import* (from your last edit)
   std <- filter_by_basis(std, basis_filter = basis_filter)
-  if (nrow(std) == 0) warning("No records after basisOfRecord filtering.")
   
-  # Save STANDARDIZED  << NEW filenames
   std_out <- paste0("gbifSEAsia_", ttl, "OccDataStandardized_", bor_tag, "_", shp_tag, "_", date_stamp, ".csv")
   readr::write_csv(std, std_out)
-  message("Saved standardized table: ", std_out)
   
-  # 4) Clean
   clean <- clean_occurrences(std, study_shp_path)
-  
-  # Save CLEANED  << NEW filenames
   clean_out <- paste0("gbifSEAsia_", ttl, "OccDataCleaned_", bor_tag, "_", shp_tag, "_", date_stamp, ".csv")
   readr::write_csv(clean, clean_out)
-  message("Saved cleaned table: ", clean_out)
   
-  # 5) Plot  << NEW filenames
-  rp <- make_region_poly()
+  # --- Build region pack with the requested bbox and plot --------------------
+  rp <- make_region_poly(bbox = user_bbox)      # << NEW
   plot_obj <- make_heatmap(
     clean,
     out_prefix = paste0(taxon_label, "_", bor_tag, "_", shp_tag, "_digitised_occurrences"),
     region_pack = rp
   )
   
-  # 6) Density table  << NEW filenames
   dens <- region_density(clean, region_col = "COUNTRY")
   dens_out <- paste0(taxon_label, "_occurrence_density_", bor_tag, "_", shp_tag, "_", date_stamp, ".csv")
   readr::write_csv(dens, dens_out)
-  message("Saved density table: ", dens_out)
   
-  list(
-    download_keys = dl_keys,
-    standardized  = std,
-    cleaned       = clean,
-    heatmap       = plot_obj,
-    density_table = dens
-  )
+  list(download_keys = dl_keys, standardized = std, cleaned = clean,
+       heatmap = plot_obj, density_table = dens)
 }
 
 
@@ -650,15 +670,17 @@ plants_keys <- list(
 
 # Frogs (Anura = 952)
 frog_res <- run_gbif_pipeline(
-  taxon_label = "anura",
-  taxon_key   = 952,
-  scope       = names(frog_keys),
+  taxon_label = "anura", 
+  taxon_key = 952, 
+  scope = names(frog_keys),
   study_shp_path = "PNGIDP.shp",
-  download_keys_override = frog_keys,   # pre-made keys
+  download_keys_override = frog_keys, 
   reuse_cleaned = FALSE,
-  basis_filter = c("PRESERVED_SPECIMEN")
+  basis_filter = c("PRESERVED_SPECIMEN"),
+  bbox = c(xmin = 130.5, xmax = 155, ymin = -11, ymax = 2)
 )
 
+#xmin = 95, xmax = 156, ymin = -10.3, ymax = 22
 
 mammal_res <- run_gbif_pipeline(
   taxon_label = "mammalia",
