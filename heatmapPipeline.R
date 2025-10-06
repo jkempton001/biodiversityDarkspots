@@ -59,6 +59,14 @@ REGION_META <- list(
   png         = list(island="New Guinea", country="Papua New Guinea")
 )
 
+# ---- helper: make a concise basisOfRecord tag for filenames ---------------
+make_bor_tag <- function(basis_filter) {
+  if (is.null(basis_filter) || length(basis_filter) == 0) return("ALLBOR")
+  tag <- paste(sort(unique(toupper(basis_filter))), collapse = "+")
+  paste0("BOR-", gsub("[^A-Z0-9_+]", "", tag))
+}
+
+
 # ── Plot region (same window you used) ────────────────────────────────────────
 
 make_region_poly <- function() {
@@ -180,6 +188,7 @@ import_and_bind <- function(download_keys_named) {
   bind_rows(out)
 }
 
+
 # 4) Light taxonomic and column standardization
 standardize_for_modeling <- function(df){
   df |>
@@ -188,8 +197,15 @@ standardize_for_modeling <- function(df){
     rename(collector = recordedBy, number = recordNumber, lat = decimalLatitude, long = decimalLongitude) |>
     select(family, gen, sp, authority, collector, number, lat, long,
            countryCode, year, coordinateUncertaintyInMeters, coordinatePrecision,
-           taxonRank, ISLAND, COUNTRY)
+           taxonRank, ISLAND, COUNTRY, basisOfRecord)   # << keep basisOfRecord
 }
+
+# ---- NEW: filter standardized data by basisOfRecord if requested -----------
+filter_by_basis <- function(std_df, basis_filter = NULL){
+  if (is.null(basis_filter) || length(basis_filter) == 0) return(std_df)
+  std_df %>% dplyr::filter(.data$basisOfRecord %in% basis_filter)
+}
+
 
 # 5) Cleaning (CoordinateCleaner + clip to study shapefile + species-level filter)
 clean_occurrences <- function(df, study_shp_path) {
@@ -242,8 +258,9 @@ clean_occurrences <- function(df, study_shp_path) {
 }
 
 # 6) Find cleaned data, if it already exists
-find_latest_cleaned_csv <- function(taxon_label) {
-  pat <- paste0("^gbifSEAsia_", stringr::str_to_title(taxon_label), "OccDataCleaned_\\d{8}\\.csv$")
+find_latest_cleaned_csv <- function(taxon_label, bor_tag = "ALLBOR") {
+  pat <- paste0("^gbifSEAsia_", stringr::str_to_title(taxon_label),
+                "OccDataCleaned_", bor_tag, "_\\d{8}\\.csv$")
   files <- list.files(pattern = pat)
   if (length(files) == 0) return(NULL)
   dates <- as.Date(stringr::str_extract(files, "\\d{8}"), "%Y%m%d")
@@ -435,26 +452,27 @@ run_gbif_pipeline <- function(taxon_label,
                               study_shp_path = "territory_selection.shp",
                               download_keys_override = NULL,
                               reuse_cleaned = TRUE,
-                              cleaned_csv = NULL) {
+                              cleaned_csv = NULL,
+                              basis_filter = NULL) {             # << NEW
   date_stamp <- format(Sys.Date(), "%Y%m%d")
   ttl <- stringr::str_to_title(taxon_label)
-  message("=== ", toupper(taxon_label), " / taxonKey=", taxon_key, " ===")
+  bor_tag <- make_bor_tag(basis_filter)                         # << NEW
+  message("=== ", toupper(taxon_label), " / taxonKey=", taxon_key,
+          " / ", bor_tag, " ===")
   
   # ---------------------------------------------------------------------------
-  # 0) If requested, try to reuse an existing CLEANED CSV and skip to plotting
+  # 0) Reuse cleaned?
   # ---------------------------------------------------------------------------
   if (!is.null(cleaned_csv) && file.exists(cleaned_csv)) {
     message("Reusing cleaned occurrences from: ", cleaned_csv)
     clean <- readr::read_csv(cleaned_csv, show_col_types = FALSE)
-    std <- NULL   # not recomputed in reuse path
-    dl_keys <- NULL
+    std <- NULL; dl_keys <- NULL
   } else if (isTRUE(reuse_cleaned)) {
-    latest <- find_latest_cleaned_csv(taxon_label)
+    latest <- find_latest_cleaned_csv(taxon_label, bor_tag = bor_tag)
     if (!is.null(latest)) {
-      message("Reusing latest cleaned CSV found in working directory: ", latest)
+      message("Reusing latest cleaned CSV found: ", latest)
       clean <- readr::read_csv(latest, show_col_types = FALSE)
-      std <- NULL
-      dl_keys <- NULL
+      std <- NULL; dl_keys <- NULL
     } else {
       clean <- NULL
     }
@@ -462,29 +480,26 @@ run_gbif_pipeline <- function(taxon_label,
     clean <- NULL
   }
   
-  # If we already have 'clean', jump to plotting & density
   if (!is.null(clean)) {
     rp <- make_region_poly()
-    plot_obj <- make_heatmap(clean, out_prefix = paste0(taxon_label, "_digitised_occurrences"), region_pack = rp)
+    plot_obj <- make_heatmap(
+      clean,
+      out_prefix = paste0(taxon_label, "_", bor_tag, "_digitised_occurrences"),
+      region_pack = rp
+    )
     dens <- region_density(clean, region_col = "COUNTRY")
-    dens_out <- paste0(taxon_label, "_occurrence_density_", date_stamp, ".csv")
+    dens_out <- paste0(taxon_label, "_occurrence_density_", bor_tag, "_", date_stamp, ".csv")
     readr::write_csv(dens, dens_out)
     message("Saved density table: ", dens_out)
-    
-    return(list(
-      download_keys = dl_keys,
-      standardized  = std,
-      cleaned       = clean,
-      heatmap       = plot_obj,
-      density_table = dens
-    ))
+    return(list(download_keys = NULL, standardized = NULL, cleaned = clean,
+                heatmap = plot_obj, density_table = dens))
   }
   
   # ---------------------------------------------------------------------------
-  # 1) Download (or reuse provided keys)  — unchanged
+  # 1) Download (NO basisOfRecord filtering here)
   # ---------------------------------------------------------------------------
   if (is.null(download_keys_override)) {
-    dl_keys <- occ_download_by_regions(taxon_key, scope)
+    dl_keys <- occ_download_by_regions(taxon_key, scope)  # unchanged
   } else {
     dl_keys <- download_keys_override
     stopifnot(all(names(dl_keys) %in% names(REGIONS)))
@@ -492,41 +507,51 @@ run_gbif_pipeline <- function(taxon_label,
   }
   
   # ---------------------------------------------------------------------------
-  # 2) Import & bind  — unchanged
+  # 2) Import & bind
   # ---------------------------------------------------------------------------
   raw <- import_and_bind(dl_keys)
   
   # ---------------------------------------------------------------------------
-  # 3) Standardize essential columns
+  # 3) Standardize
   # ---------------------------------------------------------------------------
   std <- standardize_for_modeling(raw)
   
-  # Save the STANDARDIZED (uncleaned) dataset   <<<< rename to Standardized
-  std_out <- paste0("gbifSEAsia_", ttl, "OccDataStandardized_", date_stamp, ".csv")
+  # ---------------------------------------------------------------------------
+  # 3b) Filter by basisOfRecord *after import only*
+  # ---------------------------------------------------------------------------
+  std <- filter_by_basis(std, basis_filter = basis_filter)
+  if (nrow(std) == 0) warning("No records after basisOfRecord filtering.")
+  
+  # Save STANDARDIZED
+  std_out <- paste0("gbifSEAsia_", ttl, "OccDataStandardized_", bor_tag, "_", date_stamp, ".csv")
   readr::write_csv(std, std_out)
   message("Saved standardized table: ", std_out)
   
   # ---------------------------------------------------------------------------
-  # 4) Clean with CoordinateCleaner + shapefile clip + taxonomic filter
+  # 4) Clean
   # ---------------------------------------------------------------------------
   clean <- clean_occurrences(std, study_shp_path)
   
-  # Save the CLEANED dataset
-  clean_out <- paste0("gbifSEAsia_", ttl, "OccDataCleaned_", date_stamp, ".csv")
+  # Save CLEANED
+  clean_out <- paste0("gbifSEAsia_", ttl, "OccDataCleaned_", bor_tag, "_", date_stamp, ".csv")
   readr::write_csv(clean, clean_out)
   message("Saved cleaned table: ", clean_out)
   
   # ---------------------------------------------------------------------------
-  # 5) Plot heatmap & save SVG
+  # 5) Plot
   # ---------------------------------------------------------------------------
   rp <- make_region_poly()
-  plot_obj <- make_heatmap(clean, out_prefix = paste0(taxon_label, "_digitised_occurrences"), region_pack = rp)
+  plot_obj <- make_heatmap(
+    clean,
+    out_prefix = paste0(taxon_label, "_", bor_tag, "_digitised_occurrences"),
+    region_pack = rp
+  )
   
   # ---------------------------------------------------------------------------
   # 6) Density table
   # ---------------------------------------------------------------------------
   dens <- region_density(clean, region_col = "COUNTRY")
-  dens_out <- paste0(taxon_label, "_occurrence_density_", date_stamp, ".csv")
+  dens_out <- paste0(taxon_label, "_occurrence_density_", bor_tag, "_", date_stamp, ".csv")
   readr::write_csv(dens, dens_out)
   message("Saved density table: ", dens_out)
   
@@ -636,8 +661,9 @@ frog_res <- run_gbif_pipeline(
   taxon_key   = 952,
   scope       = names(frog_keys),
   study_shp_path = "territory_selection.shp",
-  download_keys_override = frog_keys,
-  reuse_cleaned = TRUE
+  download_keys_override = frog_keys,   # pre-made keys
+  reuse_cleaned = FALSE,
+  basis_filter = c("PRESERVED_SPECIMEN")
 )
 
 
