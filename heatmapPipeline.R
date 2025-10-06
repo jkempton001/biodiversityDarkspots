@@ -301,13 +301,20 @@ find_latest_cleaned_csv <- function(taxon_label, bor_tag = "ALLBOR", shp_tag = "
 
 # 7) Grid heatmap (same styling; returns ggplot object and writes SVG)
 make_heatmap <- function(clean_df, out_prefix, region_pack = make_region_poly(), cellsize = 0.5) {
+  # Unpack region data prepared by make_region_poly()
   regionPoly   <- region_pack$regionPoly
   borders_clip <- region_pack$borders_clip
   
-  xy <- clean_df |> select(gen, sp, long, lat) |> tidyr::drop_na() |>
-    mutate(id = row_number())
+  # ✅ Always honor the requested bbox if present; otherwise fall back to land bbox
+  bb <- if (!is.null(region_pack$bbox)) region_pack$bbox else sf::st_bbox(regionPoly)
   
-  bb <- sf::st_bbox(regionPoly)   # <- get bounding box from sf object
+  # Points df
+  xy <- clean_df |>
+    dplyr::select(gen, sp, long, lat) |>
+    tidyr::drop_na() |>
+    dplyr::mutate(id = dplyr::row_number())
+  
+  # Raster grid based on the requested bbox
   r <- terra::rast(
     xmin = bb["xmin"], xmax = bb["xmax"],
     ymin = bb["ymin"], ymax = bb["ymax"],
@@ -318,36 +325,22 @@ make_heatmap <- function(clean_df, out_prefix, region_pack = make_region_poly(),
   pts <- terra::vect(xy[, c("long","lat")], geom = c("long","lat"), crs = "EPSG:4326")
   rcount <- terra::rasterize(pts, r, fun = "count", background = 0)
   rcount <- terra::mask(rcount, terra::vect(regionPoly))
+  names(rcount) <- "numCollections"
   
-  # After you compute `rcount` and mask it
-  names(rcount) <- "numCollections"  # give the layer a stable name
-  
-  # Convert to polygons AND keep the values as an attribute
+  # Raster cells -> polygons, keep values, drop outer NA cells
   grid_v  <- terra::as.polygons(rcount, dissolve = FALSE, values = TRUE)
-  
-  # Drop NA cells (outside mask) to keep plot tidy
   grid_v  <- grid_v[!is.na(terra::values(grid_v)$numCollections), ]
-  
-  # To sf
   grid_sf <- sf::st_as_sf(grid_v)
-  
-  # Make sure type is integer
   grid_sf$numCollections <- as.integer(grid_sf$numCollections)
   
-  
-  # --- Build a one-time sea mask = bbox minus land (used to hide overhang) ---
-  bb_sfc   <- sf::st_as_sfc(sf::st_bbox(regionPoly))
+  # Build sea mask = bbox polygon minus land
+  bb_sfc   <- sf::st_as_sfc(bb)
   land     <- sf::st_union(regionPoly)
   sea_mask <- suppressWarnings(sf::st_difference(bb_sfc, land))
   
-  # Ocean & graticule styling
-  ocean_fill <- "grey90"
-  
-  # 
-  # --- Bin + palette (unchanged) ---
+  # Bins & palette
   bin_levels <- c("0","1–25","26–100","101–500","501–1000","1001–1500","1501–2000",">2000")
-  
-  grid_sf_binned <- grid_sf %>%
+  grid_sf_binned <- grid_sf |>
     dplyr::mutate(
       collection_bin = cut(
         numCollections,
@@ -369,58 +362,50 @@ make_heatmap <- function(clean_df, out_prefix, region_pack = make_region_poly(),
     ">2000"      = "#FFB6C8"
   )
   
-  
-  # --- ALIGN GRATICULE WITH TICKS & PANEL GRID ----
-  bb <- sf::st_bbox(regionPoly)
-  
-  # choose steps
+  # Graticule aligned to nice breaks, based on the requested bbox
   lon_step <- 10
   lat_step <- 5
-  
-  # snap to neat multiples so ticks fall on round degrees
   lon_min <- floor(bb["xmin"] / lon_step) * lon_step
   lon_max <- ceiling(bb["xmax"] / lon_step) * lon_step
   lat_min <- floor(bb["ymin"] / lat_step) * lat_step
   lat_max <- ceiling(bb["ymax"] / lat_step) * lat_step
-  
   lon_breaks <- seq(lon_min, lon_max, by = lon_step)
   lat_breaks <- seq(lat_min, lat_max, by = lat_step)
   
-  # build graticule exactly at those breaks
   graticule <- sf::st_graticule(
     x   = bb,
     crs = sf::st_crs(regionPoly),
     lon = lon_breaks,
     lat = lat_breaks
   )
+  grat_sea  <- suppressWarnings(sf::st_intersection(graticule, sea_mask))
   
-  # keep only the parts of the graticule that lie over the sea
-  grat_sea <- suppressWarnings(sf::st_intersection(graticule, sea_mask))
-  
-  # pretty axis labels (optional)
+  # Axis labels
   lab_lon <- function(x) paste0(abs(x), "°", ifelse(x < 0, "W", ifelse(x > 0, "E", "")))
   lab_lat <- function(y) paste0(abs(y), "°", ifelse(y < 0, "S", ifelse(y > 0, "N", "")))
   
-  # --- PLOT (layer order matters) ---
+  ocean_fill <- "grey90"
+  
+  # Plot
   p <- ggplot() +
     # heatmap cells
     geom_sf(data = grid_sf_binned, aes(fill = collection_bin), color = NA) +
-    # sea mask (hides coastal overhang)
+    # sea mask to hide coastal overhang
     geom_sf(data = sea_mask, fill = ocean_fill, color = NA) +
-    # graticule *on top of sea* so lines are visible and do not cross land
-    geom_sf(data = grat_sea, color = "white", linewidth = 0.5) +
-    # color scale
+    # graticule lines (only over sea so they don't cross land)
+    geom_sf(data = grat_sea, linewidth = 0.5, color = "white") +
+    # manual palette & legend
     scale_fill_manual(
       name   = "Sample locations",
       values = pal,
       limits = bin_levels,
       drop   = FALSE,
-      guide_legend(override.aes = list(fill = pal))
+      guide  = guide_legend(override.aes = list(colour = NA))
     ) +
-    # make ticks align with our graticule
+    # axes aligned with graticule
     scale_x_continuous(breaks = lon_breaks, labels = lab_lon, expand = c(0, 0)) +
     scale_y_continuous(breaks = lat_breaks, labels = lab_lat, expand = c(0, 0)) +
-    # keep the plotted window exactly to the bbox so breaks land cleanly
+    # ✅ lock panel to requested bbox
     coord_sf(
       xlim = c(bb["xmin"], bb["xmax"]),
       ylim = c(bb["ymin"], bb["ymax"]),
@@ -429,8 +414,8 @@ make_heatmap <- function(clean_df, out_prefix, region_pack = make_region_poly(),
     # outlines
     geom_sf(data = regionPoly, fill = NA, colour = "grey60", linewidth = 0.2) +
     geom_sf(data = borders_clip, color = "grey60", linewidth = 0.2) +
+    # theme
     theme(
-      # use our own graticule lines; turn off the background grid
       panel.grid.major = element_blank(),
       panel.grid.minor = element_blank(),
       panel.background = element_rect(fill = ocean_fill, colour = NA),
@@ -444,11 +429,14 @@ make_heatmap <- function(clean_df, out_prefix, region_pack = make_region_poly(),
       legend.key.height      = unit(0.4, "cm")
     )
   
-  
+  # Write SVG
   ggsave(
     filename = paste0(out_prefix, "_heatmap.svg"),
     plot = p, width = 8, height = 6, units = "in", dpi = 300
   )
+  
+  # Also return the plot object for interactive sessions
+  invisible(p)
 }
 
 # 7) Region density table (per COUNTRY by default; change to ISLAND if preferred)
@@ -676,8 +664,8 @@ frog_res <- run_gbif_pipeline(
   study_shp_path = "PNGIDP.shp",
   download_keys_override = frog_keys, 
   reuse_cleaned = FALSE,
-  basis_filter = c("PRESERVED_SPECIMEN"),
-  bbox = c(xmin = 130.5, xmax = 155, ymin = -11, ymax = 2)
+  #basis_filter = c("PRESERVED_SPECIMEN")
+  bbox = c(xmin = 129, xmax = 156, ymin = -12, ymax = 4.5)
 )
 
 #xmin = 95, xmax = 156, ymin = -10.3, ymax = 22
@@ -686,34 +674,41 @@ mammal_res <- run_gbif_pipeline(
   taxon_label = "mammalia",
   taxon_key   = 359,
   scope       = names(mammal_keys),
-  study_shp_path = "territory_selection.shp",
+  study_shp_path = "PNGIDP.shp",
   download_keys_override = mammal_keys,
-  reuse_cleaned = FALSE        # default; can even omit
+  reuse_cleaned = FALSE,
+  #basis_filter = c("PRESERVED_SPECIMEN")
+  bbox = c(xmin = 129, xmax = 156, ymin = -12, ymax = 4.5)
 )
 
 bird_res <- run_gbif_pipeline(
   taxon_label = "aves",
   taxon_key   = 212,
   scope       = names(bird_keys),
-  study_shp_path = "territory_selection.shp",
+  study_shp_path = "indoPacificIslands.shp",
   download_keys_override = bird_keys,
-  reuse_cleaned = FALSE        # default; can even omit
+  reuse_cleaned = FALSE,
+  bbox = c(xmin = 129, xmax = 156, ymin = -12, ymax = 4.5)
 )
 
 squamates_res <- run_gbif_pipeline(
   taxon_label = "squamates",
   taxon_key   = 11592253,
   scope       = names(squamate_keys),
-  study_shp_path = "territory_selection.shp",
+  study_shp_path = "PNGIDP.shp",
   download_keys_override = squamate_keys,
-  reuse_cleaned = FALSE        # default; can even omit
+  reuse_cleaned = FALSE,
+  #basis_filter = c("PRESERVED_SPECIMEN")
+  bbox = c(xmin = 129, xmax = 156, ymin = -12, ymax = 4.5)
 )
 
 plants_res <- run_gbif_pipeline(
   taxon_label = "tracheophyta",
   taxon_key   = 7707728,
   scope       = names(plants_keys),
-  study_shp_path = "territory_selection.shp",
+  study_shp_path = "PNGIDP.shp",
   download_keys_override = plants_keys,
-  reuse_cleaned = FALSE        # default; can even omit
+  reuse_cleaned = FALSE,
+  #basis_filter = c("PRESERVED_SPECIMEN")
+  bbox = c(xmin = 129, xmax = 156, ymin = -12, ymax = 4.5)
 )
