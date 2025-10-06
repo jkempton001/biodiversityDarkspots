@@ -3,11 +3,9 @@
 library(sf)
 library(dplyr)
 library(ggplot2)
-library(tmap)
-library(mapview)
 
 # EDIT THIS: path to your shapefile (.shp)
-shp_path <- "territory_selection.shp"
+shp_path <- "PNGIDP.shp"
 
 
 # 1) Read the shapefile
@@ -37,18 +35,3 @@ p <- ggplot(borders_4326) +
   theme_minimal()
 
 print(p)
-
-# 5) Interactive map in RStudio Viewer (mapview)
-#    - Automatically picks a sensible basemap
-#    - Hover to see attributes; set 'zcol' to color by a field if you like
-z_field <- if (!is.null(label_col)) label_col else NA
-mapviewOptions(fgb = TRUE)  # fast rendering
-mv <- mapview(borders_4326, zcol = z_field, layer.name = "Territory Borders")
-mv  # appears in the Viewer pane
-
-# 6) (Optional) Interactive tmap with basemap tiles
-tmap_mode("view")
-tm <- tm_shape(borders_4326) +
-  tm_polygons(alpha = 0, border.col = "black") +
-  tm_view(view.legend.position = c("left", "bottom"))
-tm

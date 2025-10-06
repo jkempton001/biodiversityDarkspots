@@ -5,6 +5,8 @@ library(rnaturalearth)
 library(rnaturalearthdata)
 library(ggplot2)
 
+#=========================== INDO-PACIFC ISLANDS ==============================#
+
 # ------------------------------------------------------------------------------
 # 1) Pull admin boundaries
 # ------------------------------------------------------------------------------
@@ -83,3 +85,100 @@ st_write(territory, "territory_selection.shp", delete_layer = TRUE)
 
 # Strongly recommended alternative (single-file, modern format):
 # st_write(territory, "territory_selection.gpkg", layer = "territory", delete_layer = TRUE)
+
+#================================== NEW GUINEA ================================#
+
+# ------------------------------------------------------------------------------
+# 1) Countries: keep PNG
+# ------------------------------------------------------------------------------
+ctry <- rnaturalearth::ne_countries(scale = "large", returnclass = "sf") %>%
+  st_make_valid()
+
+png_ctry <- ctry %>%
+  filter(iso_a3 == "PNG") %>%
+  select(iso_a3, name_long, geometry) %>%
+  mutate(src = "Papua New Guinea")
+
+# ------------------------------------------------------------------------------
+# 2) Indonesian provinces: return to legacy 2-province scheme
+# ------------------------------------------------------------------------------
+idn_states <- rnaturalearth::ne_states(country = "Indonesia", returnclass = "sf") %>%
+  st_make_valid()
+
+pick_names <- function(df, nm) {
+  cols <- intersect(c("name", "name_en"), names(df))
+  df %>%
+    dplyr::filter(dplyr::if_any(dplyr::all_of(cols), ~ .x %in% nm))
+}
+
+
+# Try direct old names first
+papua_old       <- pick_names(idn_states, c("Papua"))
+papua_barat_old <- pick_names(idn_states, c("Papua Barat", "West Papua"))
+
+# If either missing, aggregate from the newer six-province split
+if (nrow(papua_old) == 0 | nrow(papua_barat_old) == 0) {
+  papua_group_names <- c("Papua", "Papua Tengah", "Central Papua",
+                         "Papua Pegunungan", "Highland Papua",
+                         "Papua Selatan", "South Papua")
+  papua_barat_group_names <- c("Papua Barat", "West Papua",
+                               "Papua Barat Daya", "Southwest Papua")
+  
+  papua_grp <- pick_names(idn_states, papua_group_names) %>%
+    summarise(geometry = st_union(geometry), .groups = "drop") %>%
+    mutate(name = "Papua")
+  
+  papua_barat_grp <- pick_names(idn_states, papua_barat_group_names) %>%
+    summarise(geometry = st_union(geometry), .groups = "drop") %>%
+    mutate(name = "Papua Barat")
+  
+  id_papua2 <- bind_rows(papua_grp, papua_barat_grp) %>%
+    mutate(src = paste0("IDN - ", name)) %>%
+    select(src, geometry) %>%
+    st_make_valid()
+} else {
+  # Old scheme present — just keep as-is (dissolve to one feature per province)
+  id_papua2 <- bind_rows(
+    papua_old  %>% mutate(name = "Papua"),
+    papua_barat_old %>% mutate(name = "Papua Barat")
+  ) %>%
+    group_by(name) %>%
+    summarise(geometry = st_union(geometry), .groups = "drop") %>%
+    mutate(src = paste0("IDN - ", name)) %>%
+    select(src, geometry) %>%
+    st_make_valid()
+}
+
+# ------------------------------------------------------------------------------
+# 3) Combine PNG + legacy two Papuan provinces
+# ------------------------------------------------------------------------------
+combo <- bind_rows(
+  png_ctry %>% select(src, geometry),
+  id_papua2 %>% select(src, geometry)
+) %>% st_make_valid()
+
+# Optional: dissolve to single mask (comment out to keep three features)
+territory_mask <- combo %>%
+  summarise(geometry = st_union(geometry)) %>%
+  st_make_valid()
+
+# ------------------------------------------------------------------------------
+# 4) Plot
+# ------------------------------------------------------------------------------
+ggplot() +
+  geom_sf(data = combo, aes(fill = src), color = "gray25", linewidth = 0.25) +
+  theme_minimal() +
+  labs(title = "Papua New Guinea + Legacy Indonesian Papua Provinces")
+
+# ------------------------------------------------------------------------------
+# 5) Save
+# ------------------------------------------------------------------------------
+# Recommended: per-feature GeoPackage (PNG + Papua + Papua Barat)
+#st_write(combo, "png_papua_legacy.gpkg", layer = "png_papua_legacy", delete_layer = TRUE)
+
+# If you want a single dissolved mask instead:
+# st_write(territory_mask, "png_papua_legacy_mask.gpkg", layer = "mask", delete_layer = TRUE)
+
+# Shapefile option if required:
+st_write(combo, "PNGIDP.shp", delete_layer = TRUE)
+
