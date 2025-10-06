@@ -1,7 +1,5 @@
 # One-time requirements
 
-# Testing GitKraken
-
 # ── Libraries (your list as-is) ─────────────────────────────────────────────────
 library(terra); library(maps); library(mapdata); library(letsR); library(sf)
 library(dplyr); library(ggplot2); library(scico); library(rnaturalearth)
@@ -9,20 +7,6 @@ library(purrr); library(smoothr); library(readr); library(tidyverse)
 library(CoordinateCleaner); library(countrycode); library(ggrastr); library(rgbif)
 library(magrittr); library(bit64); library(keyring); library(geodata)
 library(stringr); library(tidyr); library(units)
-
-# Basis-of-record
-
-VALID_BOR <- c(
-  "OBSERVATION","MACHINE_OBSERVATION","HUMAN_OBSERVATION",
-  "MATERIAL_SAMPLE","MATERIAL_CITATION","PRESERVED_SPECIMEN","OCCURRENCE"
-)
-
-bor_tag <- function(bor_vec) {
-  if (is.null(bor_vec)) return("BOR-all")                # not used in this proposal, but safe
-  bor_vec <- toupper(bor_vec)
-  if (length(bor_vec) == 1) paste0("BOR-", bor_vec) else "BOR-multi"
-}
-
 
 # ── Credentials ────────────────────────────────────────────────────────────────
 get_gbif_credentials <- function(service_user = "jkempton001") {
@@ -77,293 +61,57 @@ REGION_META <- list(
 
 # ── Plot region (same window you used) ────────────────────────────────────────
 
-make_region_poly <- function(
-    region_geom = NULL,         # <- union of polygons (sf) to define the map window
-    region_bbox = NULL,         # <- alternatively, pass an explicit bbox (named vector)
-    map_margin_deg = c(0.5, 0.5, 0.5, 0.5)  # c(left, right, bottom, top) padding (deg)
-) {
+make_region_poly <- function() {
   world <- rnaturalearth::ne_countries(scale = "medium", returnclass = "sf")
   malaysia <- rnaturalearth::ne_countries(country = "Malaysia", returnclass = "sf")
-  east_my <- sf::st_crop(malaysia, c(xmin = 108, xmax = 131, ymin = -7, ymax = 8))
-  
-  # Fallback: original “Indo-Pacific” selection if no geom/bbox was provided
-  default_keep <- world |>
-    dplyr::filter(name %in% c("Indonesia","Brunei","Philippines","Papua New Guinea","Timor-Leste")) |>
-    dplyr::bind_rows(east_my) |>
-    sf::st_make_valid() |>
-    sf::st_union()
-  
-  # Determine the region (land) polygon we’ll display
-  base_region <- sf::st_make_valid(region_geom %||% default_keep)
-  
-  # Determine bbox: either from user, or from the region_geom/default_keep
-  if (is.null(region_bbox)) {
-    bb <- sf::st_bbox(base_region)
-  } else {
-    stopifnot(all(c("xmin","xmax","ymin","ymax") %in% names(region_bbox)))
-    bb <- region_bbox
-  }
-  
-  # Apply margin (degrees)
-  if (length(map_margin_deg) == 1) map_margin_deg <- rep(map_margin_deg, 4)
-  bb["xmin"] <- bb["xmin"] - map_margin_deg[1]
-  bb["xmax"] <- bb["xmax"] + map_margin_deg[2]
-  bb["ymin"] <- bb["ymin"] - map_margin_deg[3]
-  bb["ymax"] <- bb["ymax"] + map_margin_deg[4]
-  
-  # Clip region to that bbox
-  bbox_sfc <- sf::st_as_sfc(bb)
-  regionPoly <- suppressWarnings(sf::st_intersection(base_region, bbox_sfc)) |>
-    sf::st_make_valid() |>
-    sf::st_as_sf()
-  
-  # Boundary lines, clipped and filtered to the plotting area
-  borders <- rnaturalearth::ne_download(
-    scale = "large", type = "admin_0_boundary_lines_land",
-    category = "cultural", returnclass = "sf"
-  ) |> sf::st_make_valid()
-  
-  borders_clip <- suppressWarnings(sf::st_intersection(borders, bbox_sfc))
-  borders_clip <- borders_clip[sf::st_intersects(borders_clip, regionPoly, sparse = FALSE), ]
-  
-  list(regionPoly = regionPoly, borders_clip = borders_clip, bbox = bb)
+  east_my <- st_crop(malaysia, c(xmin=108, xmax=131, ymin=-7, ymax=8))
+  keep <- world |> filter(name %in% c("Indonesia","Brunei","Philippines","Papua New Guinea","Timor-Leste"))
+  region_keep <- bind_rows(keep, east_my) |> st_make_valid() |> st_union()
+  bbox <- st_bbox(c(xmin = 95, xmax = 156, ymin = -10.3, ymax = 22), crs = st_crs(world))
+  regionPoly <- st_crop(region_keep, bbox) |> st_make_valid() |> st_as_sf()
+  borders <- ne_download(scale="large", type="admin_0_boundary_lines_land", category="cultural", returnclass="sf") |>
+    st_make_valid()
+  bbox_sfc <- st_as_sfc(bbox)
+  borders_clip <- suppressWarnings(st_intersection(borders, bbox_sfc))
+  borders_clip <- borders_clip[st_intersects(borders_clip, regionPoly, sparse = FALSE), ]
+  list(regionPoly = st_make_valid(regionPoly), borders_clip = borders_clip, bbox = bbox)
 }
-# ---------- NEW: utils to construct a region geometry from REGIONS codes -----
-
-# Safe null-coalescing helper
-`%||%` <- function(x, y) if (is.null(x)) y else x
-
-# Pull the GADM/ISO3 codes for a set of scope names (REGIONS entries)
-codes_for_scope <- function(scope_names) {
-  stopifnot(all(scope_names %in% names(REGIONS)))
-  unlist(REGIONS[scope_names], use.names = FALSE)
-}
-
-# Given a single code, return an sf polygon
-# - "IDN.22_1" style => GADM level 1 feature
-# - "PNG" style (3-letter ISO) => admin0 country polygon
-geom_from_code <- function(code, gadm_cache = new.env(parent = emptyenv())) {
-  # Returns an sf polygon feature in EPSG:4326 for either:
-  # - ISO3 country code (e.g., "PNG"), or
-  # - GADM L1 code (e.g., "IDN.22_1")
-  
-  out <- if (grepl("^[A-Z]{3}$", code)) {
-    # ---- ISO3 COUNTRY BRANCH ----
-    w <- rnaturalearth::ne_countries(scale = "medium", returnclass = "sf")
-    code <- toupper(code)
-    
-    # pick the first ISO3-like column that exists
-    iso_cols <- intersect(c("iso_a3", "adm0_a3", "gu_a3"), names(w))
-    if (length(iso_cols) == 0) stop("Could not find any ISO3 column in Natural Earth data.")
-    iso_col <- iso_cols[1]
-    
-    cand <- w[toupper(w[[iso_col]]) == code, , drop = FALSE]
-    if (nrow(cand) == 0) stop("Could not find country with ISO3=", code)
-    cand
-    
-  } else if (grepl("^[A-Z]{3}\\.\\d+_\\d+$", code)) {
-    # ---- GADM CODE BRANCH (e.g., "IDN.22_1") ----
-    iso3  <- sub("\\..*$", "", code)
-    level <- as.integer(sub(".*_(\\d+)$", "\\1", code))
-    key   <- paste0(iso3, "_L", level)
-    
-    gadm_obj <- if (!exists(key, envir = gadm_cache)) {
-      x <- geodata::gadm(country = iso3, level = level, path = tempdir())
-      assign(key, x, envir = gadm_cache); x
-    } else {
-      get(key, envir = gadm_cache)
-    }
-    
-    # coerce SpatVector -> sf if needed
-    if (inherits(gadm_obj, "SpatVector")) gadm_obj <- sf::st_as_sf(gadm_obj)
-    
-    gid_col <- paste0("GID_", level)
-    if (!gid_col %in% names(gadm_obj))
-      stop("GADM table for ", iso3, " level ", level, " lacks column ", gid_col)
-    
-    sel <- gadm_obj[gadm_obj[[gid_col]] == code, ]
-    if (nrow(sel) == 0) stop("Could not find GADM feature for code: ", code)
-    sel
-    
-  } else {
-    stop("Unrecognised region code format: ", code)
-  }
-  
-  # ---- Normalise to valid EPSG:4326 sf ----
-  out <- sf::st_make_valid(out)
-  if (is.na(sf::st_crs(out))) sf::st_crs(out) <- sf::st_crs(4326)
-  if (!identical(sf::st_crs(out)$epsg, 4326L)) out <- sf::st_transform(out, 4326)
-  
-  out
-}
-
-
-
-# Union a set of codes (IDN.22_1, PNG, etc.) into one geometry
-# ---- robust: union a set of codes into one MULTIPOLYGON sf in EPSG:4326 ----
-region_geom_from_codes <- function(codes) {
-  stopifnot(length(codes) > 0)
-  
-  # standardise one sf to 2D MULTIPOLYGON in EPSG:4326 and return geometry (sfc)
-  standardise <- function(sfobj) {
-    obj <- sf::st_make_valid(sfobj)
-    # enforce CRS
-    if (is.na(sf::st_crs(obj))) sf::st_crs(obj) <- sf::st_crs(4326)
-    if (!identical(sf::st_crs(obj)$epsg, 4326L)) obj <- sf::st_transform(obj, 4326)
-    
-    # drop non-area bits & force 2D MULTIPOLYGON
-    geom <- sf::st_geometry(obj)
-    geom <- sf::st_zm(geom, drop = TRUE, what = "ZM")                       # drop Z/M
-    geom <- sf::st_collection_extract(geom, "POLYGON", warn = FALSE)        # only polygons
-    geom <- sf::st_cast(geom, "MULTIPOLYGON", warn = FALSE)                 # unify types
-    geom
-  }
-  
-  # get each code’s geometry (sfc)
-  parts <- lapply(codes, function(cd) standardise(geom_from_code(cd)))
-  
-  # guard against empties
-  lens <- vapply(parts, length, integer(1))
-  if (any(lens == 0))
-    stop("At least one code resolved to an empty geometry: ",
-         paste(codes[which(lens==0)], collapse = ", "))
-  
-  # concatenate sfc safely and union
-  combined <- do.call(c, parts)                      # c.sfc
-  sf::st_crs(combined) <- sf::st_crs(4326)           # ensure CRS sticks
-  unioned  <- sf::st_union(sf::st_combine(combined)) # dissolve internal borders
-  
-  # wrap back into sf
-  sf::st_as_sf(data.frame(id = 1), geometry = sf::st_sfc(unioned, crs = 4326))
-}
-
-
 
 #=============================== CORE BUILDING BLOCKS =========================#
 
 # 1) Download: by regions for a taxonKey
-occ_download_by_regions <- function(
-    taxon_key,
-    scope_names,
-    format = "DWCA",
-    basis_of_record = VALID_BOR,     # if you added BOR param earlier
-    max_concurrent = 3,
-    poll_every_sec = 120,
-    retry_max = 6
-) {
+occ_download_by_regions <- function(taxon_key, scope_names, format = "DWCA") {
   stopifnot(all(scope_names %in% names(REGIONS)))
-  if (!all(toupper(basis_of_record) %in% VALID_BOR)) {
-    bad <- setdiff(toupper(basis_of_record), VALID_BOR)
-    stop("Unknown basis_of_record value(s): ", paste(bad, collapse = ", "))
-  }
-  
-  # helper to launch one download, with retry if GBIF says "too many simultaneous"
-  launch_one <- function(region_name) {
-    region_codes <- REGIONS[[region_name]]
-    
+  keys <- map(scope_names, function(nm){
+    region_codes <- REGIONS[[nm]]
     preds <- list(
       pred("taxonKey", taxon_key),
-      if (length(basis_of_record) == 1) pred("basisOfRecord", toupper(basis_of_record))
-      else pred_in("basisOfRecord", toupper(basis_of_record)),
+      pred_in("basisOfRecord", c("OBSERVATION","MACHINE_OBSERVATION","HUMAN_OBSERVATION",
+                                 "MATERIAL_SAMPLE","MATERIAL_CITATION","PRESERVED_SPECIMEN","OCCURRENCE")),
       pred("hasGeospatialIssue", FALSE),
       pred("hasCoordinate", TRUE),
       pred("occurrenceStatus", "PRESENT")
     )
-    
     if (length(region_codes) == 1) {
       preds <- append(preds, list(pred("gadm", region_codes)), after = 1)
     } else {
       preds <- append(preds, list(pred_in("gadm", region_codes)), after = 1)
     }
-    
-    attempt <- 1
-    repeat {
-      key <- tryCatch({
-        do.call(
-          occ_download,
-          c(preds, format = format, user = GBIF_USER, pwd = GBIF_PWD, email = GBIF_EMAIL)
-        )
-      }, error = function(e) {
-        msg <- tolower(conditionMessage(e))
-        if (grepl("download limitation is exceeded|too many simultaneous downloads", msg) &&
-            attempt < retry_max) {
-          wait <- poll_every_sec * attempt
-          message("GBIF limit hit starting '", region_name, "'. Retrying in ", wait, "s (attempt ",
-                  attempt + 1, "/", retry_max, ") …")
-          Sys.sleep(wait)
-          return(NULL)  # signal retry
-        }
-        stop(e)
-      })
-      if (!is.null(key)) break
-      attempt <- attempt + 1
-    }
-    message("Started ", region_name, " => ", key)
-    key
-  }
-  
-  # status helper
-  get_status <- function(key) {
-    meta <- rgbif::occ_download_meta(key)
-    if (is.null(meta$status)) return(NA_character_)
-    meta$status
-  }
-  
-  # queue/active/results
-  queue <- scope_names
-  active <- list()   # region_name -> key
-  results <- list()  # region_name -> key (finished)
-  
-  cat("Started downloads for:", paste(scope_names, collapse = ", "),
-      "\nBasis of record filter:", paste(basis_of_record, collapse = ", "),
-      "\nMax concurrent:", max_concurrent, "\n")
-  
-  while (length(queue) > 0 || length(active) > 0) {
-    
-    # fill up to concurrency limit
-    while (length(queue) > 0 && length(active) < max_concurrent) {
-      nm <- queue[[1]]; queue <- queue[-1]
-      key <- launch_one(nm)
-      active[[nm]] <- key
-    }
-    
-    # poll current actives
-    if (length(active) > 0) {
-      statuses <- purrr::imap_chr(active, function(key, nm) {
-        st <- get_status(key)
-        message("  [", nm, "] status: ", st)
-        st
-      })
-      
-      # move finished jobs to results (keep FAILED/KILLED/CANCELLED but warn)
-      finished <- names(statuses)[statuses %in% c("SUCCEEDED","FAILED","KILLED","CANCELLED")]
-      if (length(finished) > 0) {
-        for (nm in finished) {
-          if (statuses[[nm]] != "SUCCEEDED")
-            warning("Download for '", nm, "' ended with status ", statuses[[nm]],
-                    ". Key: ", active[[nm]])
-          results[[nm]] <- active[[nm]]
-          active[[nm]] <- NULL
-        }
-      }
-      
-      # if still have running jobs, wait before next poll
-      if (length(active) > 0) Sys.sleep(poll_every_sec)
-    }
-  }
-  
-  # return keys in the same naming style as before
-  results[scope_names]
+    do.call(occ_download, c(preds, format = format, user = GBIF_USER, pwd = GBIF_PWD, email = GBIF_EMAIL))
+  })
+  names(keys) <- scope_names
+  cat("Started downloads for:", paste(scope_names, collapse = ", "), "\n")
+  keys
 }
 
 # ---- NEW: robust DWCA reader (handles quoted newlines etc.) -------------------
 read_dwca_occurrence <- function(download_key) {
   zip_path <- rgbif::occ_download_get(download_key, overwrite = TRUE)
-
+  
   # unzip to a temp dir
   tmpdir <- tempfile("dwca_"); dir.create(tmpdir)
   utils::unzip(zip_path, exdir = tmpdir)
-
+  
   # find the occurrence core file
   occ_file <- list.files(
     tmpdir,
@@ -372,7 +120,7 @@ read_dwca_occurrence <- function(download_key) {
     ignore.case = TRUE
   )
   if (length(occ_file) == 0) stop("occurrence core not found in the archive")
-
+  
   # robust read (treat everything as character first; respect quotes/newlines)
   df <- readr::read_delim(
     occ_file[1],
@@ -390,7 +138,7 @@ read_dwca_occurrence <- function(download_key) {
 
 # 2) Import + standardize one archive
 import_one_dwca <- function(download_key, island, country) {
-
+  
   
   # --- NEW: use robust DWCA reader -------------------------------------------
   dat <- read_dwca_occurrence(download_key)
@@ -494,16 +242,13 @@ clean_occurrences <- function(df, study_shp_path) {
 }
 
 # 6) Find cleaned data, if it already exists
-find_latest_cleaned_csv <- function(taxon_label, suffix = NULL) {
-  base <- paste0("^gbifSEAsia_", stringr::str_to_title(taxon_label), "OccDataCleaned_\\d{8}")
-  if (!is.null(suffix)) base <- paste0(base, "_", stringr::str_replace_all(suffix, "[^A-Za-z0-9_-]", ""))
-  pat <- paste0(base, "\\.csv$")
+find_latest_cleaned_csv <- function(taxon_label) {
+  pat <- paste0("^gbifSEAsia_", stringr::str_to_title(taxon_label), "OccDataCleaned_\\d{8}\\.csv$")
   files <- list.files(pattern = pat)
   if (length(files) == 0) return(NULL)
   dates <- as.Date(stringr::str_extract(files, "\\d{8}"), "%Y%m%d")
   files[order(dates, decreasing = TRUE)][1]
 }
-
 
 # 7) Grid heatmap (same styling; returns ggplot object and writes SVG)
 make_heatmap <- function(clean_df, out_prefix, region_pack = make_region_poly(), cellsize = 0.5) {
@@ -552,7 +297,7 @@ make_heatmap <- function(clean_df, out_prefix, region_pack = make_region_poly(),
   # 
   # --- Bin + palette (unchanged) ---
   bin_levels <- c("0","1–25","26–100","101–500","501–1000","1001–1500","1501–2000",">2000")
-
+  
   grid_sf_binned <- grid_sf %>%
     dplyr::mutate(
       collection_bin = cut(
@@ -563,7 +308,7 @@ make_heatmap <- function(clean_df, out_prefix, region_pack = make_region_poly(),
       ),
       collection_bin = factor(collection_bin, levels = bin_levels)
     )
-
+  
   pal <- c(
     "0"          = "#FFFFFF",
     "1–25"       = "#EAF2FF",
@@ -574,8 +319,8 @@ make_heatmap <- function(clean_df, out_prefix, region_pack = make_region_poly(),
     "1501–2000"  = "#FFE1B8",
     ">2000"      = "#FFB6C8"
   )
-
-
+  
+  
   # --- ALIGN GRATICULE WITH TICKS & PANEL GRID ----
   bb <- sf::st_bbox(regionPoly)
   
@@ -650,7 +395,7 @@ make_heatmap <- function(clean_df, out_prefix, region_pack = make_region_poly(),
       legend.key.height      = unit(0.4, "cm")
     )
   
-    
+  
   ggsave(
     filename = paste0(out_prefix, "_heatmap.svg"),
     plot = p, width = 8, height = 6, units = "in", dpi = 300
@@ -690,35 +435,26 @@ run_gbif_pipeline <- function(taxon_label,
                               study_shp_path = "territory_selection.shp",
                               download_keys_override = NULL,
                               reuse_cleaned = TRUE,
-                              cleaned_csv = NULL,
-                              basis_of_record = VALID_BOR,
-                              run_suffix = NULL,
-                              max_concurrent = 3,
-                              poll_every_sec = 15,
-                              # NEW: mapping extent controls
-                              map_scope = NULL,           # vector of names from REGIONS to define map extent
-                              map_bbox = NULL,            # explicit bbox override (named c(xmin,xmax,ymin,ymax))
-                              map_margin_deg = 0.5)     # padding for the bbox
-  {
+                              cleaned_csv = NULL) {
   date_stamp <- format(Sys.Date(), "%Y%m%d")
   ttl <- stringr::str_to_title(taxon_label)
-  borT <- bor_tag(basis_of_record)
-  suffix <- if (!is.null(run_suffix)) run_suffix else borT
+  message("=== ", toupper(taxon_label), " / taxonKey=", taxon_key, " ===")
   
-  message("=== ", toupper(taxon_label), " / taxonKey=", taxon_key,
-          " / ", paste0("BOR=", paste(basis_of_record, collapse=",")), " ===")
-  
-  # 0) Reuse cleaned CSV?
+  # ---------------------------------------------------------------------------
+  # 0) If requested, try to reuse an existing CLEANED CSV and skip to plotting
+  # ---------------------------------------------------------------------------
   if (!is.null(cleaned_csv) && file.exists(cleaned_csv)) {
     message("Reusing cleaned occurrences from: ", cleaned_csv)
     clean <- readr::read_csv(cleaned_csv, show_col_types = FALSE)
-    std <- NULL; dl_keys <- NULL
+    std <- NULL   # not recomputed in reuse path
+    dl_keys <- NULL
   } else if (isTRUE(reuse_cleaned)) {
-    latest <- find_latest_cleaned_csv(taxon_label, suffix = suffix)  # <-- updated
+    latest <- find_latest_cleaned_csv(taxon_label)
     if (!is.null(latest)) {
       message("Reusing latest cleaned CSV found in working directory: ", latest)
       clean <- readr::read_csv(latest, show_col_types = FALSE)
-      std <- NULL; dl_keys <- NULL
+      std <- NULL
+      dl_keys <- NULL
     } else {
       clean <- NULL
     }
@@ -726,83 +462,71 @@ run_gbif_pipeline <- function(taxon_label,
     clean <- NULL
   }
   
+  # If we already have 'clean', jump to plotting & density
   if (!is.null(clean)) {
     rp <- make_region_poly()
-    plot_obj <- make_heatmap(clean,
-                             out_prefix = paste0(taxon_label, "_digitised_occurrences_", suffix),
-                             region_pack = rp)
+    plot_obj <- make_heatmap(clean, out_prefix = paste0(taxon_label, "_digitised_occurrences"), region_pack = rp)
     dens <- region_density(clean, region_col = "COUNTRY")
-    dens_out <- paste0(taxon_label, "_occurrence_density_", date_stamp, "_", suffix, ".csv")
+    dens_out <- paste0(taxon_label, "_occurrence_density_", date_stamp, ".csv")
     readr::write_csv(dens, dens_out)
     message("Saved density table: ", dens_out)
     
     return(list(
       download_keys = dl_keys,
-      standardized  = NULL,
+      standardized  = std,
       cleaned       = clean,
       heatmap       = plot_obj,
       density_table = dens
     ))
   }
   
-  # 1) Download
+  # ---------------------------------------------------------------------------
+  # 1) Download (or reuse provided keys)  — unchanged
+  # ---------------------------------------------------------------------------
   if (is.null(download_keys_override)) {
-    dl_keys <- occ_download_by_regions(
-      taxon_key,
-      scope,
-      basis_of_record = basis_of_record,
-      max_concurrent = max_concurrent,
-      poll_every_sec = poll_every_sec
-    )
+    dl_keys <- occ_download_by_regions(taxon_key, scope)
   } else {
     dl_keys <- download_keys_override
     stopifnot(all(names(dl_keys) %in% names(REGIONS)))
     message("Using provided download keys (skipping new downloads).")
   }
   
-  # 2) Import & bind
+  # ---------------------------------------------------------------------------
+  # 2) Import & bind  — unchanged
+  # ---------------------------------------------------------------------------
   raw <- import_and_bind(dl_keys)
   
-  # 3) Standardize
+  # ---------------------------------------------------------------------------
+  # 3) Standardize essential columns
+  # ---------------------------------------------------------------------------
   std <- standardize_for_modeling(raw)
-  std_out <- paste0("gbifSEAsia_", ttl, "OccDataStandardized_", date_stamp, "_", suffix, ".csv")
+  
+  # Save the STANDARDIZED (uncleaned) dataset   <<<< rename to Standardized
+  std_out <- paste0("gbifSEAsia_", ttl, "OccDataStandardized_", date_stamp, ".csv")
   readr::write_csv(std, std_out)
   message("Saved standardized table: ", std_out)
   
-  # 4) Clean
+  # ---------------------------------------------------------------------------
+  # 4) Clean with CoordinateCleaner + shapefile clip + taxonomic filter
+  # ---------------------------------------------------------------------------
   clean <- clean_occurrences(std, study_shp_path)
-  clean_out <- paste0("gbifSEAsia_", ttl, "OccDataCleaned_", date_stamp, "_", suffix, ".csv")
+  
+  # Save the CLEANED dataset
+  clean_out <- paste0("gbifSEAsia_", ttl, "OccDataCleaned_", date_stamp, ".csv")
   readr::write_csv(clean, clean_out)
   message("Saved cleaned table: ", clean_out)
   
-  # 5) Plot
-  map_scope_eff <- map_scope %||% scope
-  map_codes <- codes_for_scope(map_scope_eff)
-  message("Map codes: ", paste(map_codes, collapse = ", "))
+  # ---------------------------------------------------------------------------
+  # 5) Plot heatmap & save SVG
+  # ---------------------------------------------------------------------------
+  rp <- make_region_poly()
+  plot_obj <- make_heatmap(clean, out_prefix = paste0(taxon_label, "_digitised_occurrences"), region_pack = rp)
   
-  # Build unioned map geometry (will error loudly if something is wrong)
-  reg_geom <- region_geom_from_codes(map_codes)
-  
-  # Quick sanity: print bbox we’re about to use
-  message("Union bbox (pre-margin): ",
-          paste(round(unname(sf::st_bbox(reg_geom)), 4), collapse = ", "))
-  
-  rp <- make_region_poly(
-    region_geom    = reg_geom,
-    region_bbox    = map_bbox,        # normally NULL so bbox derives from reg_geom
-    map_margin_deg = map_margin_deg
-  )
-  
-  message("Plot bbox (post-margin): ",
-          paste(round(unname(rp$bbox), 4), collapse = ", "))
-  
-  plot_obj <- make_heatmap(clean,
-                           out_prefix = paste0(taxon_label, "_digitised_occurrences_", suffix),
-                           region_pack = rp)
-  
-  # 6) Density
+  # ---------------------------------------------------------------------------
+  # 6) Density table
+  # ---------------------------------------------------------------------------
   dens <- region_density(clean, region_col = "COUNTRY")
-  dens_out <- paste0(taxon_label, "_occurrence_density_", date_stamp, "_", suffix, ".csv")
+  dens_out <- paste0(taxon_label, "_occurrence_density_", date_stamp, ".csv")
   readr::write_csv(dens, dens_out)
   message("Saved density table: ", dens_out)
   
@@ -906,21 +630,15 @@ plants_keys <- list(
 
 
 
+# Frogs (Anura = 952)
 frog_res <- run_gbif_pipeline(
   taxon_label = "anura",
   taxon_key   = 952,
-  scope       = names(frog_keys),                # data scope (unchanged)
+  scope       = names(frog_keys),
   study_shp_path = "territory_selection.shp",
   download_keys_override = frog_keys,
-  reuse_cleaned = FALSE,
-  basis_of_record =  c(
-    "OBSERVATION","MACHINE_OBSERVATION","HUMAN_OBSERVATION",
-    "MATERIAL_SAMPLE","MATERIAL_CITATION","PRESERVED_SPECIMEN","OCCURRENCE"
-  ),
-  map_scope    = c("papua_barat","papua","png"), 
-  map_margin_deg = 0.25
+  reuse_cleaned = TRUE
 )
-
 
 
 mammal_res <- run_gbif_pipeline(
@@ -950,13 +668,11 @@ squamates_res <- run_gbif_pipeline(
   reuse_cleaned = FALSE        # default; can even omit
 )
 
-
 plants_res <- run_gbif_pipeline(
   taxon_label = "tracheophyta",
   taxon_key   = 7707728,
   scope       = names(plants_keys),
   study_shp_path = "territory_selection.shp",
-  download_keys_override = NULL,
-  reuse_cleaned = FALSE,
-  basis_of_record = "PRESERVED_SPECIMEN"
+  download_keys_override = plants_keys,
+  reuse_cleaned = FALSE        # default; can even omit
 )
