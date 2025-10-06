@@ -1,5 +1,7 @@
 # One-time requirements
 
+# Testing GitKraken
+
 # ── Libraries (your list as-is) ─────────────────────────────────────────────────
 library(terra); library(maps); library(mapdata); library(letsR); library(sf)
 library(dplyr); library(ggplot2); library(scico); library(rnaturalearth)
