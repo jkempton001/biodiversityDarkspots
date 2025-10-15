@@ -734,7 +734,8 @@ regions <- list(
   phillipines = "PHL",
   brunei = "BRN",
   sabah = "MYS.13_1",
-  sarawak = "MYS.14_1")
+  sarawak = "MYS.14_1",
+  madagascar = "MDG")
   
 
 # Create standardized download function ----
@@ -1374,7 +1375,8 @@ regions <- list(
   phillipines = "PHL",
   brunei = "BRN",
   sabah = "MYS.13_1",
-  sarawak = "MYS.14_1")
+  sarawak = "MYS.14_1",
+  madagascar = "MDG")
   
 
 # Create standardized download function ----
@@ -2014,7 +2016,8 @@ regions <- list(
   phillipines = "PHL",
   brunei = "BRN",
   sabah = "MYS.13_1",
-  sarawak = "MYS.14_1")
+  sarawak = "MYS.14_1",
+  madagascar = "MDG")
   
 
 # Create standardized download function ----
@@ -2655,7 +2658,8 @@ regions <- list(
   phillipines = "PHL",
   brunei      = "BRN",
   sabah       = "MYS.13_1",
-  sarawak     = "MYS.14_1"
+  sarawak     = "MYS.14_1",
+  madagascar = "MDG"
 )
   
 
