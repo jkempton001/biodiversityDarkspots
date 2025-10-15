@@ -290,17 +290,22 @@ clean_occurrences <- function(df, study_shp_path) {
 
 # 6) Find cleaned data, if it already exists
 find_latest_cleaned_csv <- function(taxon_label, bor_tag = "ALLBOR", shp_tag = "AOI-unknown") {
-  pat <- paste0("^gbifSEAsia_",
-                stringr::str_to_title(taxon_label),
-                "OccDataCleaned_", bor_tag, "_", shp_tag, "_\\d{8}\\.csv$")
+  base <- paste0("^gbifSEAsia_", stringr::str_to_title(taxon_label),
+                 "OccDataCleaned_", bor_tag, "_", shp_tag, "_")
+  # Accept YYYYMMDD or YYYYMMDD_HHMMSS
+  pat <- paste0(base, "(\\d{8})(?:_(\\d{6}))?\\.csv$")
   files <- list.files(pattern = pat)
   if (length(files) == 0) return(NULL)
-  dates <- as.Date(stringr::str_extract(files, "\\d{8}"), "%Y%m%d")
-  files[order(dates, decreasing = TRUE)][1]
+  # Extract date and optional time; order by date then time (missing time treated as 000000)
+  m <- stringr::str_match(files, paste0(base, "(\\d{8})(?:_(\\d{6}))?\\.csv$"))
+  d <- as.Date(m[,2], "%Y%m%d")
+  t <- m[,3]; t[is.na(t)] <- "000000"
+  ord <- order(d, t, decreasing = TRUE)
+  files[ord][1]
 }
 
 # 7) Grid heatmap (same styling; returns ggplot object and writes SVG)
-make_heatmap <- function(clean_df, out_prefix, region_pack = make_region_poly(), cellsize = 0.5) {
+make_heatmap <- function(clean_df, out_prefix, region_pack = make_region_poly(), cellsize = 0.5, stamp = NULL) {
   # Unpack region data prepared by make_region_poly()
   regionPoly   <- region_pack$regionPoly
   borders_clip <- region_pack$borders_clip
@@ -430,8 +435,9 @@ make_heatmap <- function(clean_df, out_prefix, region_pack = make_region_poly(),
     )
   
   # Write SVG
+  suffix <- if (!is.null(stamp)) paste0("_", stamp) else ""
   ggsave(
-    filename = paste0(out_prefix, "_heatmap.svg"),
+    filename = paste0(out_prefix, "_heatmap", suffix, ".svg"),
     plot = p, width = 8, height = 6, units = "in", dpi = 300
   )
   
@@ -506,10 +512,10 @@ run_gbif_pipeline <- function(taxon_label,
     plot_obj <- make_heatmap(
       clean,
       out_prefix = paste0(taxon_label, "_", bor_tag, "_", shp_tag, "_digitised_occurrences"),
-      region_pack = rp
+      region_pack = rp, stamp = run_stamp 
     )
     dens <- region_density(clean, region_col = "COUNTRY")
-    dens_out <- paste0(taxon_label, "_occurrence_density_", bor_tag, "_", shp_tag, "_", date_stamp, ".csv")
+    dens_out <- paste0(taxon_label, "_occurrence_density_", bor_tag, "_", shp_tag, "_", run_stamp, ".csv")
     readr::write_csv(dens, dens_out)
     return(list(download_keys = NULL, standardized = NULL, cleaned = clean,
                 heatmap = plot_obj, density_table = dens))
@@ -521,10 +527,10 @@ run_gbif_pipeline <- function(taxon_label,
       plot_obj <- make_heatmap(
         clean,
         out_prefix = paste0(taxon_label, "_", bor_tag, "_", shp_tag, "_digitised_occurrences"),
-        region_pack = rp
+        region_pack = rp, stamp = run_stamp 
       )
       dens <- region_density(clean, region_col = "COUNTRY")
-      dens_out <- paste0(taxon_label, "_occurrence_density_", bor_tag, "_", shp_tag, "_", date_stamp, ".csv")
+      dens_out <- paste0(taxon_label, "_occurrence_density_", bor_tag, "_", shp_tag, "_", run_stamp, ".csv")
       readr::write_csv(dens, dens_out)
       return(list(download_keys = NULL, standardized = NULL, cleaned = clean,
                   heatmap = plot_obj, density_table = dens))
@@ -542,11 +548,11 @@ run_gbif_pipeline <- function(taxon_label,
   std <- standardize_for_modeling(raw)
   std <- filter_by_basis(std, basis_filter = basis_filter)
   
-  std_out <- paste0("gbifSEAsia_", ttl, "OccDataStandardized_", bor_tag, "_", shp_tag, "_", date_stamp, ".csv")
+  std_out <- paste0("gbifSEAsia_", ttl, "OccDataStandardized_", bor_tag, "_", shp_tag, "_", run_stamp, ".csv")
   readr::write_csv(std, std_out)
   
   clean <- clean_occurrences(std, study_shp_path)
-  clean_out <- paste0("gbifSEAsia_", ttl, "OccDataCleaned_", bor_tag, "_", shp_tag, "_", date_stamp, ".csv")
+  clean_out <- paste0("gbifSEAsia_", ttl, "OccDataCleaned_", bor_tag, "_", shp_tag, "_", run_stamp, ".csv")
   readr::write_csv(clean, clean_out)
   
   # --- Build region pack with the requested bbox and plot --------------------
@@ -554,11 +560,11 @@ run_gbif_pipeline <- function(taxon_label,
   plot_obj <- make_heatmap(
     clean,
     out_prefix = paste0(taxon_label, "_", bor_tag, "_", shp_tag, "_digitised_occurrences"),
-    region_pack = rp
+    region_pack = rp, stamp = run_stamp 
   )
   
   dens <- region_density(clean, region_col = "COUNTRY")
-  dens_out <- paste0(taxon_label, "_occurrence_density_", bor_tag, "_", shp_tag, "_", date_stamp, ".csv")
+  dens_out <- paste0(taxon_label, "_occurrence_density_", bor_tag, "_", shp_tag, "_", run_stamp, ".csv")
   readr::write_csv(dens, dens_out)
   
   list(download_keys = dl_keys, standardized = std, cleaned = clean,
