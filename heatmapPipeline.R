@@ -344,12 +344,12 @@ make_heatmap <- function(clean_df, out_prefix, region_pack = make_region_poly(),
   sea_mask <- suppressWarnings(sf::st_difference(bb_sfc, land))
   
   # Bins & palette
-  bin_levels <- c("0","1–25","26–100","101–500","501–1000","1001–1500","1501–2000",">2000")
+  bin_levels <- c("0","1","2-25", "26-100","101-500","501-1000","1001-2000",">2000")
   grid_sf_binned <- grid_sf |>
     dplyr::mutate(
       collection_bin = cut(
         numCollections,
-        breaks = c(-Inf, 0, 25, 100, 500, 1000, 1500, 2000, Inf),
+        breaks = c(-Inf, 0, 1, 25, 100, 500, 1000, 2000, Inf),
         labels = bin_levels,
         include.lowest = TRUE, right = TRUE
       ),
@@ -358,12 +358,12 @@ make_heatmap <- function(clean_df, out_prefix, region_pack = make_region_poly(),
   
   pal <- c(
     "0"          = "#FFFFFF",
-    "1–25"       = "#EAF2FF",
-    "26–100"     = "#D7E9FF",
-    "101–500"    = "#C3DEFF",
-    "501–1000"   = "#AECFFF",
-    "1001–1500"  = "#FFF6BF",
-    "1501–2000"  = "#FFE1B8",
+    "1"       = "#EAF2FF",
+    "2-25"     = "#D7E9FF",
+    "26-100"    = "#C3DEFF",
+    "101-500"   = "#AECFFF",
+    "501-1000"  = "#FFF6BF",
+    "1001-2000"  = "#FFE1B8",
     ">2000"      = "#FFB6C8"
   )
   
@@ -401,7 +401,7 @@ make_heatmap <- function(clean_df, out_prefix, region_pack = make_region_poly(),
     geom_sf(data = grat_sea, linewidth = 0.5, color = "white") +
     # manual palette & legend
     scale_fill_manual(
-      name   = "Sample locations",
+      name   = "Digitised occurrences",
       values = pal,
       limits = bin_levels,
       drop   = FALSE,
@@ -702,11 +702,11 @@ squamates_res <- run_gbif_pipeline(
   taxon_label = "squamates",
   taxon_key   = 11592253,
   scope       = names(squamate_keys),
-  study_shp_path = "PNGIDP.shp",
+  study_shp_path = "indoPacificIslands.shp",
   download_keys_override = squamate_keys,
   reuse_cleaned = FALSE,
   #basis_filter = c("PRESERVED_SPECIMEN")
-  bbox = c(xmin = 129, xmax = 156, ymin = -12, ymax = 4.5)
+  bbox = c(xmin = 95, xmax = 156, ymin = -10.3, ymax = 22)
 )
 
 plants_res <- run_gbif_pipeline(
