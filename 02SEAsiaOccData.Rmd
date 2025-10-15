@@ -91,7 +91,8 @@ regions <- list(
   phillipines = "PHL",
   brunei = "BRN",
   sabah = "MYS.13_1",
-  sarawak = "MYS.14_1")
+  sarawak = "MYS.14_1",
+  madagascar = "MDG")
   
 
 # Create standardized download function ----
@@ -144,6 +145,7 @@ download_keys <- list()
 cat("Initiating GBIF downloads for all regions...\n")
 
 # New Guinea regions
+download_keys$madagascar <- download_gbif_occurrences(regions$madagascar, "Madagascar")
 download_keys$papua <- download_gbif_occurrences(regions$papua, "Papua")
 download_keys$papua_barat <- download_gbif_occurrences(regions$papua_barat, "Papua Barat")
 download_keys$phillipines <- download_gbif_occurrences(regions$phillipines, "Phillipines")
@@ -785,6 +787,7 @@ download_keys <- list()
 cat("Initiating GBIF downloads for all regions...\n")
 
 # New Guinea regions
+download_keys$madagascar <- download_gbif_occurrences(regions$madagascar, "Madagascar")
 download_keys$papua <- download_gbif_occurrences(regions$papua, "Papua")
 download_keys$papua_barat <- download_gbif_occurrences(regions$papua_barat, "Papua Barat")
 download_keys$phillipines <- download_gbif_occurrences(regions$phillipines, "Phillipines")
@@ -1424,6 +1427,7 @@ download_keys <- list()
 cat("Initiating GBIF downloads for all regions...\n")
 
 # New Guinea regions
+download_keys$madagascar <- download_gbif_occurrences(regions$madagascar, "Madagascar")
 download_keys$papua <- download_gbif_occurrences(regions$papua, "Papua")
 download_keys$papua_barat <- download_gbif_occurrences(regions$papua_barat, "Papua Barat")
 download_keys$phillipines <- download_gbif_occurrences(regions$phillipines, "Phillipines")
@@ -2063,6 +2067,7 @@ download_keys <- list()
 cat("Initiating GBIF downloads for all regions...\n")
 
 # New Guinea regions
+download_keys$madagascar <- download_gbif_occurrences(regions$madagascar, "Madagascar")
 download_keys$papua <- download_gbif_occurrences(regions$papua, "Papua")
 download_keys$papua_barat <- download_gbif_occurrences(regions$papua_barat, "Papua Barat")
 download_keys$phillipines <- download_gbif_occurrences(regions$phillipines, "Phillipines")
@@ -2705,6 +2710,7 @@ cat("Initiating GBIF downloads for all regions...\n")
 
 # New Guinea regions
 # New Guinea regions
+download_keys$madagascar <- download_gbif_occurrences(regions$madagascar, "Madagascar")
 download_keys$papua <- download_gbif_occurrences(regions$papua, "Papua")
 download_keys$papua_barat <- download_gbif_occurrences(regions$papua_barat, "Papua Barat")
 download_keys$phillipines <- download_gbif_occurrences(regions$phillipines, "Phillipines")
