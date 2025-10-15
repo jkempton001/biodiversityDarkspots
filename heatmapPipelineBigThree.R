@@ -106,7 +106,7 @@ make_region_poly <- function(bbox = NULL) {
   world <- rnaturalearth::ne_countries(scale = "medium", returnclass = "sf")
   malaysia <- rnaturalearth::ne_countries(country = "Malaysia", returnclass = "sf")
   east_my <- st_crop(malaysia, c(xmin=108, xmax=131, ymin=-7, ymax=8))
-  keep <- world |> dplyr::filter(name %in% c("Indonesia","Brunei","Philippines","Papua New Guinea","Timor-Leste"))
+  keep <- world |> dplyr::filter(name %in% c("Indonesia","Brunei","Philippines","Papua New Guinea","Timor-Leste","Madagascar"))
   region_keep <- dplyr::bind_rows(keep, east_my) |> st_make_valid() |> st_union()
   
   # --- NEW: normalize bbox input ---
