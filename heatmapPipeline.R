@@ -477,7 +477,7 @@ run_gbif_pipeline <- function(taxon_label,
                               bbox = NULL,                 # << NEW
                               lon_lim = NULL,              # << NEW (c(min_lon, max_lon))
                               lat_lim = NULL) {            # << NEW (c(min_lat, max_lat))
-  date_stamp <- format(Sys.Date(), "%Y%m%d")
+  run_stamp <- format(Sys.time(), "%Y%m%d_%H%M%S")
   ttl <- stringr::str_to_title(taxon_label)
   bor_tag <- make_bor_tag(basis_filter)
   shp_tag <- make_shp_tag(study_shp_path)
@@ -661,14 +661,15 @@ frog_res <- run_gbif_pipeline(
   taxon_label = "anura", 
   taxon_key = 952, 
   scope = names(frog_keys),
-  study_shp_path = "PNGIDP.shp",
+  study_shp_path = "indoPacificIslands.shp",
   download_keys_override = frog_keys, 
   reuse_cleaned = FALSE,
   #basis_filter = c("PRESERVED_SPECIMEN")
-  bbox = c(xmin = 129, xmax = 156, ymin = -12, ymax = 4.5)
+  bbox = c(xmin = 95, xmax = 156, ymin = -10.3, ymax = 22)
 )
 
-#xmin = 95, xmax = 156, ymin = -10.3, ymax = 22
+#xmin = 95, xmax = 156, ymin = -10.3, ymax = 22 - IndoPacific
+#xmin = 129, xmax = 156, ymin = -12, ymax = 4.5 - NG
 
 mammal_res <- run_gbif_pipeline(
   taxon_label = "mammalia",
