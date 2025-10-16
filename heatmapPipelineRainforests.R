@@ -12,7 +12,7 @@ library(stringr); library(tidyr); library(units)
 REGION_BBOX <- list(
   "Amazon"     = c(xmin = -82, xmax = -34, ymin = -20, ymax =  6),
   "CongoBasin" = c(xmin =   8, xmax =  32, ymin = -13, ymax =  5),
-  "IndoMalay"  = c(xmin =  90, xmax = 155, ymin = -10, ymax = 25)
+  "IndoMalay"  = c(xmin =  89, xmax = 155, ymin = -10, ymax = 25)
 )
 
 
@@ -54,30 +54,58 @@ cat("GBIF credentials loaded from keychain\n")
 
 # ── Region definitions (GADM filters for GBIF) ────────────────────────────────
 # --- ISO3 country lists for each rainforest region
-AMAZON_ISO3     <- c("BRA","PER","COL","ECU","BOL","VEN","GUY","SUR","GUF")  # French Guiana = GUF
-CONGOBASIN_ISO3 <- c("COD","COG","GAB","CMR","CAF","GNQ","AGO","RWA","BDI")  # Angola mainly Cabinda/north
-INDOMALAY_ISO3  <- c("IDN","MYS","BRN","SGP","PHL","THA","VNM","KHM","LAO","MMR","TLS")
+AMAZON_ISO3     <- c("BRA","PER","COL","ECU","BOL","VEN","GUY","SUR","GUF")
+CONGOBASIN_ISO3 <- c("COD","COG","GAB","CMR","CAF","GNQ","AGO","RWA","BDI")
+INDOMALAY_ISO3  <- c("IDN","MYS","BRN","SGP","PHL","THA","VNM","KHM","LAO","MMR","TLS","PNG")
 
-# --- Construct REGIONS (one entry per country) and REGION_META programmatically
+# NEW: region groups matching your frog_keys names
+REGION_GROUPS <- list(
+  amazon    = AMAZON_ISO3,
+  congo     = CONGOBASIN_ISO3,
+  indomalay = INDOMALAY_ISO3
+)
+
+# --- Construct REGIONS (per country) as before
 REGIONS <- c(
   setNames(AMAZON_ISO3,     paste0("amazon_",     tolower(AMAZON_ISO3))),
   setNames(CONGOBASIN_ISO3, paste0("congo_",      tolower(CONGOBASIN_ISO3))),
   setNames(INDOMALAY_ISO3,  paste0("indomalay_",  tolower(INDOMALAY_ISO3)))
 ) |> as.list()
 
-REGION_META <- purrr::imap(REGIONS, function(iso3, key){
-  region <- dplyr::case_when(
-    startsWith(key, "amazon_")    ~ "Amazon",
-    startsWith(key, "congo_")     ~ "CongoBasin",
-    startsWith(key, "indomalay_") ~ "IndoMalay",
-    TRUE ~ "Unknown"
-  )
-  list(
-    region  = region,
-    country = countrycode::countrycode(iso3, "iso3c", "country.name")
-  )
-})
+# NEW: also include the region-group keys
+REGIONS <- c(REGIONS, REGION_GROUPS)
 
+# --- REGION_META: handle both per-country and per-region-group keys
+REGION_META <- list()
+
+# per-country entries
+REGION_META <- c(
+  REGION_META,
+  purrr::imap(REGIONS[!names(REGIONS) %in% names(REGION_GROUPS)], function(iso3, key){
+    region <- dplyr::case_when(
+      startsWith(key, "amazon_")    ~ "Amazon",
+      startsWith(key, "congo_")     ~ "CongoBasin",
+      startsWith(key, "indomalay_") ~ "IndoMalay",
+      TRUE ~ "Unknown"
+    )
+    list(region = region,
+         country = countrycode::countrycode(iso3, "iso3c", "country.name"))
+  })
+)
+
+# group entries (country shown as "Multiple")
+REGION_META <- c(
+  REGION_META,
+  purrr::imap(REGION_GROUPS, function(.iso3s, key){
+    region <- dplyr::case_when(
+      key == "amazon"    ~ "Amazon",
+      key == "congo"     ~ "CongoBasin",
+      key == "indomalay" ~ "IndoMalay",
+      TRUE ~ "Unknown"
+    )
+    list(region = region, country = "Multiple")
+  })
+)
 # ---- helper: make a concise basisOfRecord tag for filenames ---------------
 make_bor_tag <- function(basis_filter) {
   if (is.null(basis_filter) || length(basis_filter) == 0) return("ALLBOR")
@@ -640,14 +668,9 @@ mammal_keys <- list(
 )
 
 frog_keys <- list(
-  papua_barat = "0020372-250920141307145",
-  papua = "0020368-250920141307145", 
-  png = "0022860-250920141307145",
-  kalimantan = "0022979-250920141307145",
-  sabah = "0020403-250920141307145",
-  sarawak = "0020405-250920141307145",
-  brunei = "0022904-250920141307145",
-  madagascar = "0025544-251009101135966"
+  amazon = "0029184-251009101135966",
+  congo = "0029187-251009101135966", 
+  indomalay = "0029189-251009101135966"
 )
 
 bird_keys <- list(
@@ -691,7 +714,7 @@ frog_res <- run_gbif_pipeline(
   taxon_label = "anura", 
   taxon_key = 952, 
   scope = names(frog_keys),
-  study_shp_path = "NGMadBor.shp",
+  study_shp_path = "rainforestRegions.shp",
   download_keys_override = frog_keys, 
   reuse_cleaned = FALSE,
   #basis_filter = c("PRESERVED_SPECIMEN"),
