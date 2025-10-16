@@ -4,6 +4,7 @@ library(dplyr)
 library(rnaturalearth)
 library(rnaturalearthdata)
 library(ggplot2)
+library(rnaturalearthhires)
 
 #=========================== INDO-PACIFC ISLANDS ==============================#
 
@@ -312,3 +313,103 @@ ggplot(three_islands) +
 st_write(three_islands, "NGMadBor.shp", delete_layer = TRUE)
 # Alternative modern container:
 # st_write(three_islands, "three_islands_by_codes.gpkg", layer = "islands", delete_layer = TRUE)
+
+## ============================= Rainforest regions ==========================##
+
+## ==================== AMAZON, CONGO BASIN, INDO-MALAY ======================##
+
+# ========================= Rainforest regions (hi-res) ======================= #
+
+st_valid <- function(g) suppressWarnings(st_make_valid(g))
+
+# ------------------------------------------------------------------------------
+# 1) Countries at 1:10m (highest detail available from Natural Earth)
+# ------------------------------------------------------------------------------
+# Use numeric scale = 10 to be explicit; requires rnaturalearthhires to be loaded
+ctry <- rnaturalearth::ne_countries(scale = 10, returnclass = "sf") %>%
+  st_valid()
+
+# ------------------------------------------------------------------------------
+# 2) Region membership via ISO3 (your lists)
+# ------------------------------------------------------------------------------
+AMAZON_ISO3     <- c("BRA","PER","COL","ECU","BOL","VEN","GUY","SUR","GUF")
+CONGOBASIN_ISO3 <- c("COD","COG","GAB","CMR","CAF","GNQ","AGO","RWA","BDI")
+INDOMALAY_ISO3  <- c("IDN","MYS","BRN","SGP","PHL","THA","VNM","KHM","LAO","MMR","TLS","PNG")
+
+# ------------------------------------------------------------------------------
+# 3) (Optional) Restrict Angola to Cabinda or northern piece only
+#     This keeps outlines sharp and avoids including Angola’s far south.
+#     We try an admin-level pick for "Cabinda"; if not found, we crop with a bbox.
+# ------------------------------------------------------------------------------
+maybe_cabinda <- function(x) {
+  # try admin name first (works with NE states)
+  ang_states <- tryCatch(
+    rnaturalearth::ne_states(country = "Angola", returnclass = "sf") %>% st_valid(),
+    error = function(e) NULL
+  )
+  if (!is.null(ang_states) && any(grepl("^Cabinda$", ang_states$name))) {
+    cab <- ang_states %>% filter(name == "Cabinda") %>% st_union() %>% st_make_valid()
+    return(cab)
+  } else {
+    # coarse north-only fallback (tweak as you like)
+    bb <- st_as_sfc(st_bbox(c(xmin = 10.5, xmax = 24.0, ymin = -8.0, ymax = -4.0), crs = 4326))
+    return(bb)
+  }
+}
+
+# ------------------------------------------------------------------------------
+# 4) Build each region (union of hi-res countries)
+#     Only topology fix is st_make_valid() (no snapping/rounding).
+# ------------------------------------------------------------------------------
+amazon <- ctry %>%
+  filter(iso_a3 %in% AMAZON_ISO3) %>%
+  summarise(region = "AMAZON", geometry = st_union(geometry), .groups = "drop") %>%
+  st_valid()
+
+congo_raw <- ctry %>%
+  filter(iso_a3 %in% CONGOBASIN_ISO3) %>%
+  st_valid()
+
+# Optionally trim Angola so only Cabinda/northern part contributes
+if ("AGO" %in% CONGOBASIN_ISO3 && any(congo_raw$iso_a3 == "AGO")) {
+  ang_mask <- maybe_cabinda(congo_raw)
+  congo_raw <- congo_raw %>%
+    mutate(geometry = ifelse(
+      iso_a3 == "AGO",
+      st_intersection(geometry, ang_mask),
+      geometry
+    )) %>%
+    st_valid()
+}
+
+congo_basin <- congo_raw %>%
+  summarise(region = "CONGO BASIN", geometry = st_union(geometry), .groups = "drop") %>%
+  st_valid()
+
+indomalay <- ctry %>%
+  filter(iso_a3 %in% INDOMALAY_ISO3) %>%
+  summarise(region = "INDO-MALAY", geometry = st_union(geometry), .groups = "drop") %>%
+  st_valid()
+
+# ------------------------------------------------------------------------------
+# 5) Combine to 3 features
+# ------------------------------------------------------------------------------
+three_rainforests <- bind_rows(amazon, congo_basin, indomalay) %>%
+  st_set_crs(4326) %>%
+  st_valid()
+
+# ------------------------------------------------------------------------------
+# 6) Quick visual check
+# ------------------------------------------------------------------------------
+ggplot(three_rainforests) +
+  geom_sf(aes(fill = region), color = "gray25", linewidth = 0.25) +
+  theme_minimal() +
+  labs(title = "Major Tropical Rainforest Regions (country-based unions, 1:10m)",
+       fill = "Region")
+
+# ------------------------------------------------------------------------------
+# 7) Write out
+# ------------------------------------------------------------------------------
+st_write(three_rainforests, "rainforestRegions.shp", delete_layer = TRUE)
+# Or:
+# st_write(three_rainforests, "rainforest_regions.gpkg", layer = "regions", delete_layer = TRUE)
