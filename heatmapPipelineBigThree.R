@@ -10,8 +10,8 @@ library(stringr); library(tidyr); library(units)
 
 ## ── Per-island map extents ─────────────────────────────────────────────────
 ISLAND_BBOX <- list(
-  "New Guinea" = c(xmin = 129, xmax = 156,  ymin = -12,  ymax = 4.5),
-  "Borneo"     = c(xmin = 108, xmax = 120.5, ymin =  -4.5, ymax = 7.8),
+  "New Guinea" = c(xmin = 129, xmax = 156,  ymin = -12,  ymax = 1),
+  "Borneo"     = c(xmin = 108, xmax = 120.5, ymin =  -4.5, ymax = 7.2),
   "Madagascar" = c(xmin =  43, xmax =  51.5, ymin = -26.5, ymax = -11)
 )
 
@@ -322,6 +322,17 @@ find_latest_cleaned_csv <- function(taxon_label, bor_tag = "ALLBOR", shp_tag = "
 }
 
 # 7) Grid heatmap (same styling; returns ggplot object and writes SVG)
+# 1 inch shows this many degrees (set once for all maps)
+DEG_PER_INCH <- 5  # try 4–8 depending on your preferred output size
+
+size_from_bbox <- function(bb, deg_per_in = DEG_PER_INCH) {
+  c(
+    width  = as.numeric(bb["xmax"] - bb["xmin"]) / deg_per_in,
+    height = as.numeric(bb["ymax"] - bb["ymin"]) / deg_per_in
+  )
+}
+
+
 make_heatmap <- function(clean_df, out_prefix, region_pack = make_region_poly(), cellsize = 0.5, stamp = NULL) {
   # Unpack region data prepared by make_region_poly()
   regionPoly   <- region_pack$regionPoly
@@ -422,7 +433,7 @@ make_heatmap <- function(clean_df, out_prefix, region_pack = make_region_poly(),
       values = pal,
       limits = bin_levels,
       drop   = FALSE,
-      guide  = guide_legend(override.aes = list(colour = NA))
+      guide  = "none" #guide_legend(override.aes = list(colour = NA))
     ) +
     # axes aligned with graticule
     scale_x_continuous(breaks = lon_breaks, labels = lab_lon, expand = c(0, 0)) +
@@ -452,6 +463,8 @@ make_heatmap <- function(clean_df, out_prefix, region_pack = make_region_poly(),
     )
   
   # Write SVG
+  dims <- size_from_bbox(bb)
+  
   suffix <- if (!is.null(stamp)) paste0("_", stamp) else ""
   ggsave(
     filename = paste0(out_prefix, "_heatmap", suffix, ".svg"),
@@ -695,21 +708,22 @@ mammal_res <- run_gbif_pipeline(
   taxon_label = "mammalia",
   taxon_key   = 359,
   scope       = names(mammal_keys),
-  study_shp_path = "indoPacificIslands.shp",
+  study_shp_path = "NGMadBor.shp",
   download_keys_override = mammal_keys,
   reuse_cleaned = FALSE,
   #basis_filter = c("PRESERVED_SPECIMEN")
-  bbox = c(xmin = 95, xmax = 156, ymin = -10.3, ymax = 22)
+  #bbox = c(xmin = 95, xmax = 156, ymin = -10.3, ymax = 22)
 )
 
 bird_res <- run_gbif_pipeline(
   taxon_label = "aves",
   taxon_key   = 212,
   scope       = names(bird_keys),
-  study_shp_path = "indoPacificIslands.shp",
+  study_shp_path = "NGMadBor.shp",
   download_keys_override = bird_keys,
   reuse_cleaned = FALSE,
-  bbox = c(xmin = 95, xmax = 156, ymin = -10.3, ymax = 22)
+  #basis_filter = c("PRESERVED_SPECIMEN")
+  #bbox = c(xmin = 95, xmax = 156, ymin = -10.3, ymax = 22)
 )
 
 squamates_res <- run_gbif_pipeline(
