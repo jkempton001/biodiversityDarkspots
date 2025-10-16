@@ -8,28 +8,28 @@ library(CoordinateCleaner); library(countrycode); library(ggrastr); library(rgbi
 library(magrittr); library(bit64); library(keyring); library(geodata)
 library(stringr); library(tidyr); library(units)
 
-## ── Per-island map extents ─────────────────────────────────────────────────
-ISLAND_BBOX <- list(
-  "New Guinea" = c(xmin = 129, xmax = 156,  ymin = -12,  ymax = 1),
-  "Borneo"     = c(xmin = 108, xmax = 120.5, ymin =  -4.5, ymax = 7.2),
-  "Madagascar" = c(xmin =  43, xmax =  51.5, ymin = -26.5, ymax = -11)
+## ── Per-region map extents ─────────────────────────────────────────────────
+REGION_BBOX <- list(
+  "Amazon"     = c(xmin = -82, xmax = -34, ymin = -20, ymax =  6),
+  "CongoBasin" = c(xmin =   8, xmax =  32, ymin = -13, ymax =  5),
+  "IndoMalay"  = c(xmin =  90, xmax = 155, ymin = -10, ymax = 25)
 )
 
 
-## ── Island-split writer ────────────────────────────────────────────────────
-write_island_svgs <- function(clean_df, out_prefix, study_shp_path) {
-  islands <- c("New Guinea", "Borneo", "Madagascar")
+## ── Region-split writer ────────────────────────────────────────────────────
+write_region_svgs <- function(clean_df, out_prefix, study_shp_path) {
+  regions <- c("Amazon","CongoBasin","IndoMalay")
   ts <- format(Sys.time(), "%Y%m%d_%H%M%S")
-  purrr::walk(islands, function(isle){
-    sub <- dplyr::filter(clean_df, .data$ISLAND == isle)
+  purrr::walk(regions, function(reg){
+    sub <- dplyr::filter(clean_df, .data$REGION == reg)
     if (nrow(sub) == 0) {
-      message("No points for ", isle, " — skipping.")
+      message("No points for ", reg, " — skipping.")
       return(invisible(NULL))
     }
-    rp <- make_region_poly(bbox = ISLAND_BBOX[[isle]])
+    rp <- make_region_poly(bbox = REGION_BBOX[[reg]])
     make_heatmap(
       sub,
-      out_prefix = paste0(out_prefix, "_", gsub("\\s+","", tolower(isle))), # suffix island name
+      out_prefix = paste0(out_prefix, "_", gsub("\\s+","", tolower(reg))),
       region_pack = rp,
       stamp = ts
     )
@@ -53,28 +53,30 @@ GBIF_USER  <- creds$user; GBIF_PWD <- creds$password; GBIF_EMAIL <- creds$email
 cat("GBIF credentials loaded from keychain\n")
 
 # ── Region definitions (GADM filters for GBIF) ────────────────────────────────
-REGIONS <- list(
-  papua_barat = "IDN.22_1",
-  papua       = "IDN.23_1",
-  kalimantan  = c("IDN.12_1","IDN.13_1","IDN.14_1","IDN.34_1","IDN.35_1"),
-  png         = "PNG",
-  brunei      = "BRN",
-  sabah       = "MYS.13_1",
-  sarawak     = "MYS.14_1",
-  madagascar  = "MDG"
-)
+# --- ISO3 country lists for each rainforest region
+AMAZON_ISO3     <- c("BRA","PER","COL","ECU","BOL","VEN","GUY","SUR","GUF")  # French Guiana = GUF
+CONGOBASIN_ISO3 <- c("COD","COG","GAB","CMR","CAF","GNQ","AGO","RWA","BDI")  # Angola mainly Cabinda/north
+INDOMALAY_ISO3  <- c("IDN","MYS","BRN","SGP","PHL","THA","VNM","KHM","LAO","MMR","TLS")
 
-# For tagging records with island & country labels in your outputs
-REGION_META <- list(
-  papua       = list(island="New Guinea", country="Indonesian Papua"),
-  papua_barat = list(island="New Guinea", country="Indonesian Papua"),
-  kalimantan  = list(island="Borneo", country="Indonesian Borneo"),
-  brunei      = list(island="Borneo", country="Brunei"),
-  sabah       = list(island="Borneo", country="Malaysian Borneo"),
-  sarawak     = list(island="Borneo", country="Malaysian Borneo"),
-  png         = list(island="New Guinea", country="Papua New Guinea"),
-  madagascar  = list(island = "Madagascar", country="Madagascar")
-)
+# --- Construct REGIONS (one entry per country) and REGION_META programmatically
+REGIONS <- c(
+  setNames(AMAZON_ISO3,     paste0("amazon_",     tolower(AMAZON_ISO3))),
+  setNames(CONGOBASIN_ISO3, paste0("congo_",      tolower(CONGOBASIN_ISO3))),
+  setNames(INDOMALAY_ISO3,  paste0("indomalay_",  tolower(INDOMALAY_ISO3)))
+) |> as.list()
+
+REGION_META <- purrr::imap(REGIONS, function(iso3, key){
+  region <- dplyr::case_when(
+    startsWith(key, "amazon_")    ~ "Amazon",
+    startsWith(key, "congo_")     ~ "CongoBasin",
+    startsWith(key, "indomalay_") ~ "IndoMalay",
+    TRUE ~ "Unknown"
+  )
+  list(
+    region  = region,
+    country = countrycode::countrycode(iso3, "iso3c", "country.name")
+  )
+})
 
 # ---- helper: make a concise basisOfRecord tag for filenames ---------------
 make_bor_tag <- function(basis_filter) {
@@ -104,16 +106,10 @@ make_shp_tag <- function(shp_path) {
 # - NULL to use your current default
 make_region_poly <- function(bbox = NULL) {
   world <- rnaturalearth::ne_countries(scale = "medium", returnclass = "sf")
-  malaysia <- rnaturalearth::ne_countries(country = "Malaysia", returnclass = "sf")
-  east_my <- st_crop(malaysia, c(xmin=108, xmax=131, ymin=-7, ymax=8))
-  keep <- world |> dplyr::filter(name %in% c("Indonesia","Brunei","Philippines","Papua New Guinea","Timor-Leste","Madagascar"))
-  region_keep <- dplyr::bind_rows(keep, east_my) |> st_make_valid() |> st_union()
-  
-  # --- NEW: normalize bbox input ---
+  # if bbox is NULL, default to a world view that still renders; else use bbox provided
   if (is.null(bbox)) {
-    bb <- sf::st_bbox(c(xmin = 95, xmax = 156, ymin = -10.3, ymax = 22), crs = sf::st_crs(world))
+    bb <- sf::st_bbox(c(xmin = -180, xmax = 180, ymin = -60, ymax = 60), crs = sf::st_crs(world))
   } else {
-    # support numeric c(xmin, xmax, ymin, ymax) or named
     if (is.numeric(bbox) && length(bbox) == 4 && is.null(names(bbox))) {
       names(bbox) <- c("xmin","xmax","ymin","ymax")
     }
@@ -122,8 +118,7 @@ make_region_poly <- function(bbox = NULL) {
                         ymin = bbox[["ymin"]], ymax = bbox[["ymax"]]),
                       crs = sf::st_crs(world))
   }
-  
-  regionPoly <- st_crop(region_keep, bb) |> st_make_valid() |> st_as_sf()
+  regionPoly <- st_crop(world, bb) |> st_make_valid() |> st_as_sf() |> st_union() |> st_as_sf()
   borders <- rnaturalearth::ne_download(scale="large", type="admin_0_boundary_lines_land",
                                         category="cultural", returnclass="sf") |>
     st_make_valid()
@@ -193,7 +188,7 @@ read_dwca_occurrence <- function(download_key) {
 
 
 # 2) Import + standardize one archive
-import_one_dwca <- function(download_key, island, country) {
+import_one_dwca <- function(download_key, region, country) {
   
   
   # --- NEW: use robust DWCA reader -------------------------------------------
@@ -223,14 +218,14 @@ import_one_dwca <- function(download_key, island, country) {
       individualCount = suppressWarnings(as.numeric(individualCount)),
       year = suppressWarnings(as.numeric(year))
     ) |>
-    tibble::add_column(ISLAND = island, COUNTRY = country)
+    tibble::add_column(REGION = region, COUNTRY = country)
 }
 
 # 3) Import all regions with tagging
 import_and_bind <- function(download_keys_named) {
   out <- map(names(download_keys_named), function(nm){
     mm <- REGION_META[[nm]]
-    tryCatch(import_one_dwca(download_keys_named[[nm]], mm$island, mm$country),
+    tryCatch(import_one_dwca(download_keys_named[[nm]], mm$region, mm$country),
              error = function(e){ message("Error importing ", nm, ": ", e$message); NULL })
   }) |> compact()
   bind_rows(out)
@@ -245,7 +240,7 @@ standardize_for_modeling <- function(df){
     rename(collector = recordedBy, number = recordNumber, lat = decimalLatitude, long = decimalLongitude) |>
     select(family, gen, sp, authority, collector, number, lat, long,
            countryCode, year, coordinateUncertaintyInMeters, coordinatePrecision,
-           taxonRank, ISLAND, COUNTRY, basisOfRecord)   # << keep basisOfRecord
+           taxonRank, REGION, COUNTRY, basisOfRecord)   # << keep basisOfRecord
 }
 
 # ---- NEW: filter standardized data by basisOfRecord if requested -----------
@@ -256,11 +251,13 @@ filter_by_basis <- function(std_df, basis_filter = NULL){
 
 
 # 5) Cleaning (CoordinateCleaner + clip to study shapefile + species-level filter)
+ALL_ISO3 <- unique(unlist(list(AMAZON_ISO3, CONGOBASIN_ISO3, INDOMALAY_ISO3)))
+ALL_ISO2 <- countrycode::countrycode(ALL_ISO3, "iso3c", "iso2c")
+
 clean_occurrences <- function(df, study_shp_path) {
-  # Basic geo filter to your study countries
   df1 <- df |>
     filter(!is.na(lat), !is.na(long)) |>
-    filter(countryCode %in% c("ID","PG","MY","PH","BN","TL","MG"))
+    filter(countryCode %in% ALL_ISO2)
   
   df2 <- df1 |>
     mutate(species = if_else(!is.na(gen) & !is.na(sp), paste(gen, sp), NA_character_)) |>
@@ -475,7 +472,7 @@ make_heatmap <- function(clean_df, out_prefix, region_pack = make_region_poly(),
   invisible(p)
 }
 
-# 7) Region density table (per COUNTRY by default; change to ISLAND if preferred)
+# 7) Region density table (per COUNTRY by default; change to region if preferred)
 region_density <- function(clean_df, region_col = "COUNTRY") {
   counts <- clean_df |>
     count(.data[[region_col]], name = "Observations") |>
@@ -547,7 +544,7 @@ run_gbif_pipeline <- function(taxon_label,
     # )
     
     # NEW:
-    write_island_svgs(
+    write_region_svgs(
       clean_df   = clean,
       out_prefix = paste0(taxon_label, "_", bor_tag, "_", shp_tag, "_digitised_occurrences"),
       study_shp_path = study_shp_path
@@ -571,7 +568,7 @@ run_gbif_pipeline <- function(taxon_label,
       # )
       
       # NEW:
-      write_island_svgs(
+      write_region_svgs(
         clean_df   = clean,
         out_prefix = paste0(taxon_label, "_", bor_tag, "_", shp_tag, "_digitised_occurrences"),
         study_shp_path = study_shp_path
@@ -613,7 +610,7 @@ run_gbif_pipeline <- function(taxon_label,
   # )
   
   # NEW:
-  write_island_svgs(
+  write_region_svgs(
     clean_df   = clean,
     out_prefix = paste0(taxon_label, "_", bor_tag, "_", shp_tag, "_digitised_occurrences"),
     study_shp_path = study_shp_path
