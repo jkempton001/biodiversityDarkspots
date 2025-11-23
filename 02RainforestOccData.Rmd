@@ -1,0 +1,3719 @@
+# Libraries
+
+```{r}
+
+# Open libraries
+
+library(terra)
+library(maps)
+library(mapdata)
+library(letsR)
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(scico)
+library(rnaturalearth)
+library(purrr)
+library(smoothr)
+library(readr)
+library(tidyverse)
+library(CoordinateCleaner)
+library(countrycode)
+library(ggrastr)
+library(rgbif)
+library(magrittr)
+library(bit64)
+library(keyring)
+library(geodata)
+
+
+
+
+```
+
+# Frogs
+
+## Download frog data
+
+```{r}
+
+
+get_gbif_credentials <- function(service_user = "jkempton001") {
+  
+  # Helper: Ensure a credential exists, else prompt to set it
+  ensure_credential <- function(service_name) {
+    existing <- tryCatch(
+      key_get(service_name, username = service_user),
+      error = function(e) NULL
+    )
+    
+    if (is.null(existing)) {
+      message(sprintf("No credential found for '%s'. Please enter it now.", service_name))
+      key_set(service_name, username = service_user)
+      existing <- key_get(service_name, username = service_user)
+    }
+    
+    return(existing)
+  }
+  
+  list(
+    user     = ensure_credential("gbif_user"),
+    password = ensure_credential("gbif_password"),
+    email    = ensure_credential("gbif_email")
+  )
+}
+
+
+# Load credentials securely
+creds <- get_gbif_credentials()
+GBIF_USER <- creds$user
+GBIF_PWD <- creds$password
+GBIF_EMAIL <- creds$email
+
+cat("GBIF credentials loaded securely from keychain\n")
+
+# Define administrative regions ----
+# Using GADM codes for precise geographic filtering
+# Note: Island-level filtering on GBIF returns inaccurate results, 
+# so we filter by administrative districts instead
+
+regions <- list(
+  amazon = c("BRA","PER","COL","ECU","BOL","VEN","GUY","SUR","GUF"),
+  congo = c("COD","COG","GAB","CMR","CAF","GNQ","AGO","RWA","BDI"),
+  indomalay = c("IDN","MYS","BRN","SGP","PHL","THA","VNM","KHM","LAO","MMR","TLS","PNG"))
+  
+
+# Create standardized download function ----
+download_gbif_occurrences <- function(region_codes, region_name) {
+  # Build predicates for the download
+  predicates <- list(
+    pred("taxonKey", 952),  # Anura
+    pred_in("basisOfRecord", c(
+      "OBSERVATION",
+      "MACHINE_OBSERVATION",
+      "HUMAN_OBSERVATION",
+      "MATERIAL_SAMPLE",
+      "MATERIAL_CITATION",
+      "PRESERVED_SPECIMEN",
+      "OCCURRENCE"
+    )),
+    pred("hasGeospatialIssue", FALSE),  # remove records with location issues
+    pred("hasCoordinate", TRUE),  # coordinates required
+    pred("occurrenceStatus", "PRESENT")  # presence records only
+  )
+  
+  # Add GADM predicates - handle both single and multiple regions
+  if (length(region_codes) == 1) {
+    predicates <- append(predicates, list(pred("gadm", region_codes)), after = 1)
+  } else {
+    # For multiple regions (like PNG mainland), add each as separate predicate
+    gadm_preds <- map(region_codes, ~pred("gadm", .x))
+    predicates <- append(predicates, list(pred_in("gadm", region_codes)), after = 1)
+  }
+  
+  # Execute download
+  download_key <- do.call(occ_download, c(
+    predicates,
+    format = "DWCA",  # Darwin Core Archive for reproducibility and citation
+    user = GBIF_USER,
+    pwd = GBIF_PWD,
+    email = GBIF_EMAIL
+  ))
+  
+  cat("Download initiated for", region_name, "- Key:", download_key, "\n")
+  return(download_key)
+}
+
+# Execute downloads for each region ----
+# Note: Each region must be downloaded separately due to rgbif limitations
+# This approach ensures precise geographic filtering for each administrative unit
+
+download_keys <- list()
+
+cat("Initiating GBIF downloads for all regions...\n")
+
+# New Guinea regions
+download_keys$amazon <- download_gbif_occurrences(regions$amazon, "Amazon")
+download_keys$congo <- download_gbif_occurrences(regions$congo, "Congo Basin")
+download_keys$indomalay <- download_gbif_occurrences(regions$indomalay, "Indo-Malay")
+
+
+# Check download status ----
+check_download_status <- function(download_keys) {
+  cat("\nChecking download status...\n")
+  for (region in names(download_keys)) {
+    status <- occ_download_meta(download_keys[[region]])$status
+    cat(region, ":", status, "\n")
+  }
+}
+
+# Uncomment to check status
+check_download_status(download_keys)
+```
+
+## Import data
+
+```{R}
+# Import downloaded data ----
+# Replace these with your actual download keys once downloads are complete
+download_keys <- list(
+  papua_barat = "0020372-250920141307145",
+  papua = "0020368-250920141307145", 
+  png = "0022860-250920141307145",
+  kalimantan = "0022979-250920141307145",
+  phillipines = "0020374-250920141307145",
+  sabah = "0020403-250920141307145",
+  sarawak = "0020405-250920141307145",
+  brunei = "0022904-250920141307145",
+  java = "0026479-250920141307145",
+  sumatra = "0026481-250920141307145",
+  bali = "0026498-250920141307145",
+  maluku = "0026509-250920141307145",
+  sulawesi = "0026482-250920141307145",
+  lesser_sunda_islands = "0026497-250920141307145"
+)
+
+# Function to import and process regional data
+import_and_process_region <- function(download_key, island, country) {
+  # Import data
+  data <- occ_download_get(download_key, overwrite = TRUE) %>%
+    occ_download_import(na.strings = c("", NA))
+  
+  # Select relevant columns and add geographic identifiers
+  processed_data <- data %>%
+    select(gbifID, license, institutionCode, collectionCode, occurrenceID, 
+           catalogNumber, recordNumber, recordedBy, eventDate, habitat, 
+           eventRemarks, locality, decimalLatitude, decimalLongitude, 
+           coordinateUncertaintyInMeters, coordinatePrecision, identifiedBy, 
+           scientificName, kingdom, phylum, class, order, family, genus, 
+           taxonRank, taxonomicStatus, elevation, elevationAccuracy, issue, 
+           taxonKey, acceptedTaxonKey, speciesKey, species, acceptedScientificName, 
+           verbatimScientificName, iucnRedListCategory, countryCode, 
+           individualCount, year, basisOfRecord, datasetName, establishmentMeans, 
+           references) %>%
+    # COMPREHENSIVE data type standardization - convert ALL columns to expected types
+    mutate(
+      # Convert ALL potentially problematic columns to character first, then to proper type
+      across(everything(), as.character)
+    ) %>%
+    # Now convert to proper types where needed
+    mutate(
+      # Numeric columns 
+      decimalLatitude = as.numeric(decimalLatitude),
+      decimalLongitude = as.numeric(decimalLongitude),
+      coordinateUncertaintyInMeters = as.numeric(coordinateUncertaintyInMeters),
+      coordinatePrecision = as.numeric(coordinatePrecision),
+      elevation = as.numeric(elevation),
+      elevationAccuracy = as.numeric(elevationAccuracy),
+      individualCount = as.numeric(individualCount),
+      year = as.numeric(year),
+      
+      # Keep ID columns as character (safer than bit64)
+      gbifID = as.character(gbifID),
+      taxonKey = as.character(taxonKey),
+      acceptedTaxonKey = as.character(acceptedTaxonKey),
+      speciesKey = as.character(speciesKey),
+      
+      # All other columns remain as character (including issue, license, eventDate, etc.)
+    ) %>%
+    add_column(ISLAND = island, COUNTRY = country)
+  
+  cat("Processed", island, "-", country, ":", nrow(processed_data), "records\n")
+  return(processed_data)
+}
+
+# Define island and country assignments
+region_metadata <- list(
+  papua = list(island = "New Guinea", country = "Indonesian Papua"),
+  papua_barat = list(island = "New Guinea", country = "Indonesian Papua"),
+  kalimantan = list(island = "Borneo", country = "Indonesian Borneo"),
+  brunei = list(island = "Borneo", country = "Brunei"),
+  phillipines = list(island = "Phillipines", country = "Phillipines"),
+  sabah = list(island = "Borneo", country = "Malaysian Borneo"),
+  sarawak = list(island = "Borneo", country = "Malaysian Borneo"),
+  java = list(island = "Java", country = "Java"),
+  sumatra = list(island = "Sumatra", country = "Sumatra"),
+  bali = list(island = "Bali", country = "Bali"),
+  maluku = list(island = "Maluku", country = "Maluku"),
+  sulawesi = list(island = "Sulawesi", country = "Sulawesi"),
+  lesser_sunda_islands = list(island = "Lesser Sunda Islands", country = "Lesser Sunda Islands"),
+  png = list(island = "New Guinea", country = "Papua New Guinea")
+)
+
+# Import and process all regional datasets
+cat("Importing and processing regional datasets...\n")
+
+# Process each dataset individually with error handling
+regional_datasets <- list()
+for (region_name in names(download_keys)) {
+  tryCatch({
+    regional_datasets[[region_name]] <- import_and_process_region(
+      download_keys[[region_name]], 
+      region_metadata[[region_name]]$island,
+      region_metadata[[region_name]]$country
+    )
+  }, error = function(e) {
+    cat("Error processing", region_name, ":", e$message, "\n")
+    regional_datasets[[region_name]] <<- NULL
+  })
+}
+
+# Remove any NULL entries (failed downloads)
+regional_datasets <- regional_datasets[!sapply(regional_datasets, is.null)]
+
+cat("Successfully processed", length(regional_datasets), "regional datasets\n")
+
+# Combine all regional datasets
+cat("Combining datasets from all regions...\n")
+
+# Additional safety check - examine data types before combining
+cat("Checking data types for consistency...\n")
+for (i in seq_along(regional_datasets)) {
+  region_name <- names(regional_datasets)[i]
+  cat("Dataset", i, "(", region_name, "):\n")
+  
+  # Check for problematic columns that have caused issues
+  problematic_cols <- c("issue", "license", "eventDate")
+  for (col in problematic_cols) {
+    if (col %in% names(regional_datasets[[i]])) {
+      col_type <- class(regional_datasets[[i]][[col]])[1]
+      cat("  ", col, ":", col_type, "\n")
+    }
+  }
+}
+
+# Combine datasets (should work smoothly now with standardized types)
+gbifSEAsiaFrogsOccData <- bind_rows(regional_datasets)
+
+cat("Successfully combined", nrow(gbifSEAsiaFrogsOccData), "records from", length(regional_datasets), "regions\n")
+
+# Optional: Check for any remaining data type issues
+cat("Data summary by column type:\n")
+gbifSEAsiaFrogsOccData %>% 
+  summarise(across(everything(), ~class(.)[1])) %>% 
+  pivot_longer(everything(), names_to = "column", values_to = "type") %>%
+  count(type) %>%
+  print()
+
+# Clean and standardize GBIF data ----
+gbifSEAsiaFrogsOccDataCleaned <- gbifSEAsiaFrogsOccData %>%
+  # Parse accepted scientific name into components
+  # Note: Many records will only have genus, or genus + species, without authority
+  # This generates expected warnings for records missing some components
+  separate(acceptedScientificName, 
+           into = c("gen", "sp", "authority"), 
+           sep = " ", 
+           extra = "merge",
+           fill = "right") %>%  # Fill missing pieces with NA (suppresses warnings)
+  # Standardize column names to match internal dataset
+  rename(collector = recordedBy,
+         number = recordNumber,
+         lat = decimalLatitude,
+         long = decimalLongitude) %>%
+  # Select core columns for modeling PLUS geographic metadata for analyses
+  select(family, gen, sp, authority, collector, number, lat, long, 
+         countryCode, year, coordinateUncertaintyInMeters, coordinatePrecision,
+         taxonRank, ISLAND, COUNTRY)
+
+# Quick data quality check
+cat("GBIF data summary after cleaning:\n")
+cat("Total records:", nrow(gbifSEAsiaFrogsOccDataCleaned), "\n")
+cat("Records with genus:", sum(!is.na(gbifSEAsiaFrogsOccDataCleaned$gen)), "\n")
+cat("Records with species:", sum(!is.na(gbifSEAsiaFrogsOccDataCleaned$sp)), "\n") 
+cat("Records with authority:", sum(!is.na(gbifSEAsiaFrogsOccDataCleaned$authority)), "\n")
+cat("Records with coordinates:", sum(!is.na(gbifSEAsiaFrogsOccDataCleaned$lat) & !is.na(gbifSEAsiaFrogsOccDataCleaned$long)), "\n")
+
+
+# Summary statistics ----
+cat("Dataset summary:\n")
+cat("Total GBIF records:", nrow(gbifSEAsiaFrogsOccDataCleaned), "\n")
+cat("Unique species:", gbifSEAsiaFrogsOccDataCleaned %>% 
+      filter(!is.na(gen), !is.na(sp)) %>% 
+      distinct(gen, sp) %>% 
+      nrow(), "\n")
+
+# Geographic distribution summary
+cat("\nGeographic distribution:\n")
+gbifSEAsiaFrogsOccDataCleaned %>% 
+  filter(!is.na(ISLAND)) %>% 
+  count(ISLAND, COUNTRY, sort = TRUE) %>%
+  print()
+
+# Preview the data structure for rWCVP workflow
+cat("\nData structure preview for rWCVP name resolution:\n")
+gbifSEAsiaFrogsOccDataCleaned %>% 
+  filter(!is.na(gen), !is.na(sp)) %>%
+  select(family, gen, sp, authority, ISLAND, COUNTRY) %>%
+  slice_head(n = 5) %>%
+  print()
+
+# Generate date stamp and save cleaned dataset ----
+date_stamp <- format(Sys.Date(), "%Y%m%d")
+output_filename <- paste0("gbifSEAsiaFrogsOccDataCleaned_", date_stamp, ".csv")
+
+write_csv(gbifSEAsiaFrogsOccDataCleaned, output_filename)
+cat("Dataset saved as:", output_filename, "\n")
+```
+
+## Clean dataset
+
+```{r}
+# Specimen collection raster #
+
+# Load raw occurrence data ----
+# Import the combined raw dataset from GBIF download script
+cat("Loading raw occurrence data...\n")
+frogSEAsiaOcc <- read_csv("gbifSEAsiaFrogsOccDataCleaned_20250928.csv")
+
+cat("Loaded dataset:", nrow(frogSEAsiaOcc), "records\n")
+#cat("Sources:", paste(unique(combined_occurrences$source), collapse = ", "), "\n")
+
+# Generate today's date stamp for output files ----
+date_stamp <- format(Sys.Date(), "%Y%m%d")
+cat("Output files will use date stamp:", date_stamp, "\n")
+
+# Initial data preparation ----
+cat("Starting data cleaning pipeline...\n")
+cat("Initial combined dataset:", nrow(frogSEAsiaOcc), "records\n")
+
+# Step 1: Basic geographic and completeness filtering ----
+frogSEAsiaOcc1 <- frogSEAsiaOcc %>%
+  # Remove records without coordinates
+  filter(!is.na(lat), !is.na(long)) %>%
+  # Filter to target countries (allowing NA for Kew data which we'll validate spatially)
+  filter(countryCode %in% c("ID", "PG","MY","PH","BN","TL"))
+
+cat("After basic filtering:", nrow(frogSEAsiaOcc1), "records remaining\n")
+
+# Step 2: CoordinateCleaner quality checks ----
+# Apply comprehensive coordinate cleaning using CoordinateCleaner
+# Note: CoordinateCleaner functions need explicit column specification when using non-default names
+
+frogSEAsiaOcc2 <- frogSEAsiaOcc1 %>%
+  # Create temporary species column for CoordinateCleaner (cc_dupl needs this)
+  mutate(species = if_else(!is.na(gen) & !is.na(sp), paste(gen, sp), NA_character_)) %>%
+  # Apply coordinate cleaning tests with explicit column specifications
+  cc_dupl(lon = "long", lat = "lat") %>%                    # Remove duplicate records within species
+  cc_zero(lon = "long", lat = "lat") %>%                    # Remove records at 0,0 coordinates  
+  cc_equ(lon = "long", lat = "lat") %>%                     # Remove records with equal lat/long
+  cc_val(lon = "long", lat = "lat") %>%                     # Remove records with invalid coordinates
+  #cc_sea(lon = "long", lat = "lat", scale = 50) %>%         # Remove marine records (scale 50 for island detail)
+  cc_cap(lon = "long", lat = "lat", buffer = 2000) %>%      # Remove records near country capitals
+  cc_cen(lon = "long", lat = "lat", buffer = 2000) %>%      # Remove records near country centroids
+  cc_gbif(lon = "long", lat = "lat", buffer = 2000) %>%     # Remove records near GBIF headquarters
+  cc_inst(lon = "long", lat = "lat", buffer = 2000) %>%     # Remove records near institutions
+  # Remove the temporary species column (we'll recreate it later for rWCVP)
+  select(-species)
+
+cat("After CoordinateCleaner filtering:", nrow(frogSEAsiaOcc2), "records remaining\n")
+cat("Records removed by coordinate cleaning:", 
+    nrow(frogSEAsiaOcc1) - nrow(frogSEAsiaOcc2), "\n")
+
+# Step 2.5: Spatial filtering to study area boundaries ----
+# Remove Kew records that fall outside New Guinea and Borneo study area
+cat("Loading study area boundaries...\n")
+study_area <- st_read("territory_selection.shp")
+
+# Convert occurrence data to spatial points
+frogSEAsiaOcc2SF <- frogSEAsiaOcc2 %>%
+  filter(!is.na(lat), !is.na(long)) %>%
+  st_as_sf(coords = c("long", "lat"), crs = 4326)
+
+# Perform spatial intersection to keep only records within study area
+records_in_study_area <- st_intersection(frogSEAsiaOcc2SF, study_area)
+
+# Convert back to regular dataframe and restore lat/long columns
+frogSEAsiaOcc2_5 <- records_in_study_area %>%
+  # Extract coordinates back to columns
+  mutate(
+    long = st_coordinates(.)[,1],
+    lat = st_coordinates(.)[,2]
+  ) %>%
+  # Remove geometry column
+  st_drop_geometry()
+
+cat("After spatial filtering to study area:", nrow(frogSEAsiaOcc2_5), "records remaining\n")
+cat("Records removed by spatial filtering:", 
+    nrow(frogSEAsiaOcc2) - nrow(frogSEAsiaOcc2_5), "\n")
+
+
+# Step 5: Taxonomic filtering ----
+# Filter for species-level identifications and clean uncertain identifications
+frogSEAsiaOcc5 <- frogSEAsiaOcc2_5 %>%
+  filter(
+    # Keep records with genus and species information
+    !is.na(gen), !is.na(sp),
+    # Remove uncertain identifications (cf., aff., sp.)
+    !grepl("\\bsp\\.?$|\\bcf\\.?\\b|\\baff\\.?\\b", sp, ignore.case = TRUE)
+    # Note: taxonRank column not available in simplified dataset
+  )
+
+cat("After taxonomic filtering:", nrow(frogSEAsiaOcc5), "records remaining\n")
+
+cat("Geographic filtering already completed during download phase\n")
+
+# Final cleaning summary ----
+frogSEAsiaOccData <- frogSEAsiaOcc5
+
+cat("\n=== CLEANING SUMMARY ===\n")
+cat("Original records:", nrow(frogSEAsiaOcc), "\n")
+cat("Final cleaned records:", nrow(frogSEAsiaOccData), "\n")
+cat("Total removed:", nrow(frogSEAsiaOcc) - nrow(frogSEAsiaOccData), "\n")
+cat("Retention rate:", round(nrow(frogSEAsiaOccData)/nrow(frogSEAsiaOcc)*100, 1), "%\n")
+```
+
+## Plot heatmap of occurrence data
+
+```{r}
+
+
+# species and lat long data
+frogSEAsiaCollXY <- frogSEAsiaOccData %>%
+  select(gen, sp, long, lat) %>%
+  na.omit()
+
+frogSEAsiaCollXY <- frogSEAsiaCollXY |> dplyr::mutate(id = dplyr::row_number(), .before = 1)
+
+# to sf object, specifying variables with coordinates and projection
+frogSEAsiaCollSF <- st_as_sf(frogSEAsiaCollXY, coords = c("long", "lat"), crs = 4326) %>%
+  group_by(id) %>%
+  summarize()
+
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+malaysia <- rnaturalearth::ne_countries(country = "Malaysia", returnclass = "sf")
+
+# Keep only Sabah, Sarawak, Labuan (i.e., Malaysian Borneo)
+
+east_my <- st_crop(malaysia, c(xmin = 108, xmax = 131, ymin = -7, ymax = 8))
+
+keep_countries <- world %>%
+  filter(name %in% c("Indonesia","Brunei","Philippines","Papua New Guinea","Timor-Leste"))
+
+# Combine: target region = (selected countries) + (East Malaysia only)
+region_keep <- bind_rows(keep_countries, east_my) %>%
+  st_make_valid() %>%
+  st_union()
+
+# Your safe box (keeps Sumatra + all Philippines)
+xlim <- c(95, 156)
+ylim <- c(-10.3, 22)
+bbox <- st_bbox(c(xmin = xlim[1], xmax = xlim[2], ymin = ylim[1], ymax = ylim[2]),
+                crs = st_crs(world))
+
+regionPoly <- st_crop(region_keep, bbox)
+
+borders <- ne_download(
+  scale = "large",                                 # finer detail helps on Borneo & New Guinea
+  type = "admin_0_boundary_lines_land",
+  category = "cultural",
+  returnclass = "sf"
+) |> st_make_valid()
+
+# Clip borders to the map window (bbox) to keep things tidy
+bbox_sfc <- st_as_sfc(bbox)
+borders_clip <- suppressWarnings(st_intersection(borders, bbox_sfc))
+borders_clip <- borders_clip[st_intersects(borders_clip, regionPoly, sparse = FALSE), ]
+
+
+# plot points
+frogCollPlot <-
+  ggplot() +
+  geom_sf(data = regionPoly, linewidth = 0.2) +
+  geom_sf(data = frogSEAsiaCollSF, pch = 21) #+
+  #scale_x_continuous(breaks = c(-84)) +
+  #theme(
+    #plot.background = element_rect(fill = "#f1f2f3"),
+    #panel.background = element_rect(fill = "#2F4051"),
+    #panel.grid = element_blank(),
+    #line = element_blank(),
+    #rect = element_blank()
+  #)
+frogCollPlot
+
+regionPoly <- regionPoly |> st_make_valid()
+
+regionGrid <- regionPoly |>
+  st_make_grid(cellsize = 0.5, what = "polygons") |>
+  st_intersection(regionPoly) |>
+  st_collection_extract("POLYGON") |>
+  st_make_valid() |>
+  st_sf() |>
+  dplyr::mutate(cellid = dplyr::row_number())
+
+gridPlot <-
+  ggplot() +
+  geom_sf(data = regionPoly) +
+  geom_sf(data = regionGrid) #+
+  #scale_x_continuous(breaks = c(-84)) +
+  #theme(
+    #plot.background = element_rect(fill = "#f1f2f3"),
+    #panel.background = element_rect(fill = "#2F4051"),
+    #panel.grid = element_blank(),
+    #line = element_blank(),
+    #rect = element_blank()
+  #)
+gridPlot
+
+frogSEAsiaCollSF <- frogSEAsiaCollSF |> st_make_valid()
+
+frogsCollRaster <- regionGrid |>
+  st_join(frogSEAsiaCollSF, join = st_intersects) |>
+  dplyr::mutate(overlap = ifelse(!is.na(id), 1, 0)) |>
+  dplyr::group_by(cellid) |>
+  dplyr::summarize(numCollections = sum(overlap), .groups = "drop")
+
+# Define levels once and reuse everywhere (avoids dash/typo mismatches)
+bin_levels <- c("0","1–25","26–100","101–500","501–1000",
+                "1001–1500","1501–2000",">2000")
+
+# Bin + lock factor levels
+frogsCollRaster_binned <- frogsCollRaster %>%
+  mutate(collection_bin = cut(
+    numCollections,
+    breaks = c(-Inf, 0, 25, 100, 500, 1000, 1500, 2000, Inf),
+    labels = bin_levels,
+    include.lowest = TRUE, right = TRUE
+  )) %>%
+  mutate(collection_bin = factor(collection_bin, levels = bin_levels))
+
+# Color palette named by the same levels (note the orange for "1501–2000")
+pal <- c(
+  "0"          = "#FFFFFF",
+  "1–25"       = "#EAF2FF",
+  "26–100"     = "#D7E9FF",
+  "101–500"    = "#C3DEFF",
+  "501–1000"   = "#AECFFF",
+  "1001–1500"  = "#FFF6BF",
+  "1501–2000"  = "#FFE1B8",   # pastel orange
+  ">2000"      = "#FFB6C8"
+)
+
+frogsCollRasterPlot <-
+  ggplot() +
+  # ocean colour: panel background
+  #theme(panel.background = element_rect(fill = "grey95", colour = NA),
+        #plot.background  = element_rect(fill = "grey95", colour = NA)) +
+  # land polygons from regionPoly
+geom_sf(data = frogsCollRaster_binned, aes(fill = collection_bin), color = NA) +
+    scale_fill_manual(
+    name   = "Sample locations",
+    values = pal,
+    limits = bin_levels,   # force order & inclusion
+    drop   = FALSE,
+    guide_legend(override.aes = list(fill = pal))
+  ) +
+    geom_sf(data = regionPoly, fill = NA, colour = "grey60", linewidth = 0.2) +
+  geom_sf(data = borders_clip, color = "grey60", linewidth = 0.2) +
+  coord_sf() +
+  theme(
+    legend.position        = "inside",           # <- tell ggplot to use inside placement
+    legend.position.inside = c(0.96, 0.96),    # <- near the top-right (Pacific corner)
+    legend.justification   = c(1, 1),            # align legend's top-right to that point
+    legend.background      = element_rect(fill = NA, colour = NA),
+    legend.title = element_text(size = 9, face='bold'),
+    legend.margin          = margin(4, 4, 4, 4),
+    legend.key.width       = unit(0.4, "cm"),
+    legend.key.height      = unit(0.4, "cm")
+  )
+
+ggsave(
+  filename = "frogSampleLocationsRasterMap.svg",  # file name and extension
+  plot     = frogsCollRasterPlot,       # your ggplot object
+  width    = 8,                          # width in inches (adjust as needed)
+  height   = 6,                          # height in inches (adjust as needed)
+  units    = "in",                        # units for width/height
+  dpi      = 300                          # resolution; affects rasterized elements
+)
+
+# Digitised occurrence density per region
+
+counts <- as.data.frame(table(frogSEAsiaOccData[[13]]))
+names(counts) <- c("Region", "Observations")
+
+# I don't know accurate these surface areas are and to what specific borders they exactly apply
+
+areas <- data.frame(
+  Region = c("Bali","Brunei","Indonesian Borneo","Indonesian Papua",
+             "Java","Lesser Sunda Islands","Malaysian Borneo","Maluku",
+             "Papua New Guinea","Phillipines","Sulawesi","Sumatra"),
+  Area_km2 = c(5590.15,5765,534698.27,412214.61,132598.77,67128.38 + 14950,
+               198445.64,78897,462840,300000,174416.16,482286.55)
+)
+
+density_table <- counts %>%
+  left_join(areas, by = "Region") %>%
+  mutate(Density = Observations / Area_km2)
+
+
+```
+
+
+# Mammals
+
+## Download mammal data
+
+```{r}
+
+
+get_gbif_credentials <- function(service_user = "jkempton001") {
+  
+  # Helper: Ensure a credential exists, else prompt to set it
+  ensure_credential <- function(service_name) {
+    existing <- tryCatch(
+      key_get(service_name, username = service_user),
+      error = function(e) NULL
+    )
+    
+    if (is.null(existing)) {
+      message(sprintf("No credential found for '%s'. Please enter it now.", service_name))
+      key_set(service_name, username = service_user)
+      existing <- key_get(service_name, username = service_user)
+    }
+    
+    return(existing)
+  }
+  
+  list(
+    user     = ensure_credential("gbif_user"),
+    password = ensure_credential("gbif_password"),
+    email    = ensure_credential("gbif_email")
+  )
+}
+
+
+
+# Load credentials securely
+creds <- get_gbif_credentials()
+GBIF_USER <- creds$user
+GBIF_PWD <- creds$password
+GBIF_EMAIL <- creds$email
+
+cat("GBIF credentials loaded securely from keychain\n")
+
+# Define administrative regions ----
+# Using GADM codes for precise geographic filtering
+# Note: Island-level filtering on GBIF returns inaccurate results, 
+# so we filter by administrative districts instead
+
+regions <- list(
+  amazon = c("BRA","PER","COL","ECU","BOL","VEN","GUY","SUR","GUF"),
+  congo = c("COD","COG","GAB","CMR","CAF","GNQ","AGO","RWA","BDI"),
+  indomalay = c("IDN","MYS","BRN","SGP","PHL","THA","VNM","KHM","LAO","MMR","TLS","PNG"))
+
+  
+
+# Create standardized download function ----
+download_gbif_occurrences <- function(region_codes, region_name) {
+  # Build predicates for the download
+  predicates <- list(
+    pred("taxonKey", 359),  # Mammals
+    pred_in("basisOfRecord", c(
+      "OBSERVATION",
+      "MACHINE_OBSERVATION",
+      "HUMAN_OBSERVATION",
+      "MATERIAL_SAMPLE",
+      "MATERIAL_CITATION",
+      "PRESERVED_SPECIMEN",
+      "OCCURRENCE"
+    )),
+    pred("hasGeospatialIssue", FALSE),  # remove records with location issues
+    pred("hasCoordinate", TRUE),  # coordinates required
+    pred("occurrenceStatus", "PRESENT")  # presence records only
+  )
+  
+  # Add GADM predicates - handle both single and multiple regions
+  if (length(region_codes) == 1) {
+    predicates <- append(predicates, list(pred("gadm", region_codes)), after = 1)
+  } else {
+    # For multiple regions (like PNG mainland), add each as separate predicate
+    gadm_preds <- map(region_codes, ~pred("gadm", .x))
+    predicates <- append(predicates, list(pred_in("gadm", region_codes)), after = 1)
+  }
+  
+  # Execute download
+  download_key <- do.call(occ_download, c(
+    predicates,
+    format = "DWCA",  # Darwin Core Archive for reproducibility and citation
+    user = GBIF_USER,
+    pwd = GBIF_PWD,
+    email = GBIF_EMAIL
+  ))
+  
+  cat("Download initiated for", region_name, "- Key:", download_key, "\n")
+  return(download_key)
+}
+
+# Execute downloads for each region ----
+# Note: Each region must be downloaded separately due to rgbif limitations
+# This approach ensures precise geographic filtering for each administrative unit
+
+download_keys <- list()
+
+cat("Initiating GBIF downloads for all regions...\n")
+
+# New Guinea regions
+download_keys$amazon <- download_gbif_occurrences(regions$amazon, "Amazon")
+download_keys$congo <- download_gbif_occurrences(regions$congo, "Congo Basin")
+download_keys$indomalay <- download_gbif_occurrences(regions$indomalay, "Indo-Malay")
+
+# Check download status ----
+check_download_status <- function(download_keys) {
+  cat("\nChecking download status...\n")
+  for (region in names(download_keys)) {
+    status <- occ_download_meta(download_keys[[region]])$status
+    cat(region, ":", status, "\n")
+  }
+}
+
+# Uncomment to check status
+check_download_status(download_keys)
+```
+
+## Import data
+
+```{R}
+# Import downloaded data ----
+# Replace these with your actual download keys once downloads are complete
+download_keys <- list(
+  papua_barat = "0024029-250920141307145",
+  papua = "0024027-250920141307145", 
+  png = "0024057-250920141307145",
+  kalimantan = "0024055-250920141307145",
+  phillipines = "0024030-250920141307145",
+  sabah = "0024038-250920141307145",
+  sarawak = "0024039-250920141307145",
+  brunei = "0024037-250920141307145",
+  java = "0027224-250920141307145",
+  sumatra = "0027225-250920141307145",
+  sulawesi = "0027229-250920141307145",
+  lesser_sunda_islands = "0027230-250920141307145",
+  bali = "0027231-250920141307145",
+  maluku = "0027244-250920141307145"
+)
+
+# Function to import and process regional data
+import_and_process_region <- function(download_key, island, country) {
+  # Import data
+  data <- occ_download_get(download_key, overwrite = TRUE) %>%
+    occ_download_import(na.strings = c("", NA))
+  
+  # Select relevant columns and add geographic identifiers
+  processed_data <- data %>%
+    select(gbifID, license, institutionCode, collectionCode, occurrenceID, 
+           catalogNumber, recordNumber, recordedBy, eventDate, habitat, 
+           eventRemarks, locality, decimalLatitude, decimalLongitude, 
+           coordinateUncertaintyInMeters, coordinatePrecision, identifiedBy, 
+           scientificName, kingdom, phylum, class, order, family, genus, 
+           taxonRank, taxonomicStatus, elevation, elevationAccuracy, issue, 
+           taxonKey, acceptedTaxonKey, speciesKey, species, acceptedScientificName, 
+           verbatimScientificName, iucnRedListCategory, countryCode, 
+           individualCount, year, basisOfRecord, datasetName, establishmentMeans, 
+           references) %>%
+    # COMPREHENSIVE data type standardization - convert ALL columns to expected types
+    mutate(
+      # Convert ALL potentially problematic columns to character first, then to proper type
+      across(everything(), as.character)
+    ) %>%
+    # Now convert to proper types where needed
+    mutate(
+      # Numeric columns 
+      decimalLatitude = as.numeric(decimalLatitude),
+      decimalLongitude = as.numeric(decimalLongitude),
+      coordinateUncertaintyInMeters = as.numeric(coordinateUncertaintyInMeters),
+      coordinatePrecision = as.numeric(coordinatePrecision),
+      elevation = as.numeric(elevation),
+      elevationAccuracy = as.numeric(elevationAccuracy),
+      individualCount = as.numeric(individualCount),
+      year = as.numeric(year),
+      
+      # Keep ID columns as character (safer than bit64)
+      gbifID = as.character(gbifID),
+      taxonKey = as.character(taxonKey),
+      acceptedTaxonKey = as.character(acceptedTaxonKey),
+      speciesKey = as.character(speciesKey),
+      
+      # All other columns remain as character (including issue, license, eventDate, etc.)
+    ) %>%
+    add_column(ISLAND = island, COUNTRY = country)
+  
+  cat("Processed", island, "-", country, ":", nrow(processed_data), "records\n")
+  return(processed_data)
+}
+
+# Define island and country assignments
+region_metadata <- list(
+  papua = list(island = "New Guinea", country = "Indonesian Papua"),
+  papua_barat = list(island = "New Guinea", country = "Indonesian Papua"),
+  kalimantan = list(island = "Borneo", country = "Indonesian Borneo"),
+  brunei = list(island = "Borneo", country = "Brunei"),
+  phillipines = list(island = "Phillipines", country = "Phillipines"),
+  sabah = list(island = "Borneo", country = "Malaysian Borneo"),
+  sarawak = list(island = "Borneo", country = "Malaysian Borneo"),
+  java = list(island = "Java", country = "Java"),
+  sumatra = list(island = "Sumatra", country = "Sumatra"),
+  bali = list(island = "Bali", country = "Bali"),
+  maluku = list(island = "Maluku", country = "Maluku"),
+  sulawesi = list(island = "Sulawesi", country = "Sulawesi"),
+  lesser_sunda_islands = list(island = "Lesser Sunda Islands", country = "Lesser Sunda Islands"),
+  png = list(island = "New Guinea", country = "Papua New Guinea")
+)
+
+# Import and process all regional datasets
+cat("Importing and processing regional datasets...\n")
+
+# Process each dataset individually with error handling
+regional_datasets <- list()
+for (region_name in names(download_keys)) {
+  tryCatch({
+    regional_datasets[[region_name]] <- import_and_process_region(
+      download_keys[[region_name]], 
+      region_metadata[[region_name]]$island,
+      region_metadata[[region_name]]$country
+    )
+  }, error = function(e) {
+    cat("Error processing", region_name, ":", e$message, "\n")
+    regional_datasets[[region_name]] <<- NULL
+  })
+}
+
+# Remove any NULL entries (failed downloads)
+regional_datasets <- regional_datasets[!sapply(regional_datasets, is.null)]
+
+cat("Successfully processed", length(regional_datasets), "regional datasets\n")
+
+# Combine all regional datasets
+cat("Combining datasets from all regions...\n")
+
+# Additional safety check - examine data types before combining
+cat("Checking data types for consistency...\n")
+for (i in seq_along(regional_datasets)) {
+  region_name <- names(regional_datasets)[i]
+  cat("Dataset", i, "(", region_name, "):\n")
+  
+  # Check for problematic columns that have caused issues
+  problematic_cols <- c("issue", "license", "eventDate")
+  for (col in problematic_cols) {
+    if (col %in% names(regional_datasets[[i]])) {
+      col_type <- class(regional_datasets[[i]][[col]])[1]
+      cat("  ", col, ":", col_type, "\n")
+    }
+  }
+}
+
+# Combine datasets (should work smoothly now with standardized types)
+gbifSEAsiaMammalOccData <- bind_rows(regional_datasets)
+
+cat("Successfully combined", nrow(gbifSEAsiaMammalOccData), "records from", length(regional_datasets), "regions\n")
+
+# Optional: Check for any remaining data type issues
+cat("Data summary by column type:\n")
+gbifSEAsiaMammalOccData %>% 
+  summarise(across(everything(), ~class(.)[1])) %>% 
+  pivot_longer(everything(), names_to = "column", values_to = "type") %>%
+  count(type) %>%
+  print()
+
+# Clean and standardize GBIF data ----
+gbifSEAsiaMammalOccDataCleaned <- gbifSEAsiaMammalOccData %>%
+  # Parse accepted scientific name into components
+  # Note: Many records will only have genus, or genus + species, without authority
+  # This generates expected warnings for records missing some components
+  separate(acceptedScientificName, 
+           into = c("gen", "sp", "authority"), 
+           sep = " ", 
+           extra = "merge",
+           fill = "right") %>%  # Fill missing pieces with NA (suppresses warnings)
+  # Standardize column names to match internal dataset
+  rename(collector = recordedBy,
+         number = recordNumber,
+         lat = decimalLatitude,
+         long = decimalLongitude) %>%
+  # Select core columns for modeling PLUS geographic metadata for analyses
+  select(family, gen, sp, authority, collector, number, lat, long, 
+         countryCode, year, coordinateUncertaintyInMeters, coordinatePrecision,
+         taxonRank, ISLAND, COUNTRY)
+
+# Quick data quality check
+cat("GBIF data summary after cleaning:\n")
+cat("Total records:", nrow(gbifSEAsiaMammalOccDataCleaned), "\n")
+cat("Records with genus:", sum(!is.na(gbifSEAsiaMammalOccDataCleaned$gen)), "\n")
+cat("Records with species:", sum(!is.na(gbifSEAsiaMammalOccDataCleaned$sp)), "\n") 
+cat("Records with authority:", sum(!is.na(gbifSEAsiaMammalOccDataCleaned$authority)), "\n")
+cat("Records with coordinates:", sum(!is.na(gbifSEAsiaMammalOccDataCleaned$lat) & !is.na(gbifSEAsiaMammalOccDataCleaned$long)), "\n")
+
+
+# Summary statistics ----
+cat("Dataset summary:\n")
+cat("Total GBIF records:", nrow(gbifSEAsiaMammalOccDataCleaned), "\n")
+cat("Unique species:", gbifSEAsiaMammalOccDataCleaned %>% 
+      filter(!is.na(gen), !is.na(sp)) %>% 
+      distinct(gen, sp) %>% 
+      nrow(), "\n")
+
+# Geographic distribution summary
+cat("\nGeographic distribution:\n")
+gbifSEAsiaMammalOccDataCleaned %>% 
+  filter(!is.na(ISLAND)) %>% 
+  count(ISLAND, COUNTRY, sort = TRUE) %>%
+  print()
+
+# Preview the data structure for rWCVP workflow
+cat("\nData structure preview for rWCVP name resolution:\n")
+gbifSEAsiaMammalOccDataCleaned %>% 
+  filter(!is.na(gen), !is.na(sp)) %>%
+  select(family, gen, sp, authority, ISLAND, COUNTRY) %>%
+  slice_head(n = 5) %>%
+  print()
+
+# Generate date stamp and save cleaned dataset ----
+date_stamp <- format(Sys.Date(), "%Y%m%d")
+output_filename <- paste0("gbifSEAsiaMammalOccDataCleaned_", date_stamp, ".csv")
+
+write_csv(gbifSEAsiaMammalOccDataCleaned, output_filename)
+cat("Dataset saved as:", output_filename, "\n")
+```
+
+## Clean dataset
+
+```{r}
+# Specimen collection raster #
+
+# Load raw occurrence data ----
+# Import the combined raw dataset from GBIF download script
+cat("Loading raw occurrence data...\n")
+mammalSEAsiaOcc <- read_csv("gbifSEAsiaMammalOccDataCleaned_20250929.csv")
+
+cat("Loaded dataset:", nrow(mammalSEAsiaOcc), "records\n")
+#cat("Sources:", paste(unique(combined_occurrences$source), collapse = ", "), "\n")
+
+# Generate today's date stamp for output files ----
+date_stamp <- format(Sys.Date(), "%Y%m%d")
+cat("Output files will use date stamp:", date_stamp, "\n")
+
+# Initial data preparation ----
+cat("Starting data cleaning pipeline...\n")
+cat("Initial combined dataset:", nrow(mammalSEAsiaOcc), "records\n")
+
+# Step 1: Basic geographic and completeness filtering ----
+mammalSEAsiaOcc1 <- mammalSEAsiaOcc %>%
+  # Remove records without coordinates
+  filter(!is.na(lat), !is.na(long)) %>%
+  # Filter to target countries (allowing NA for Kew data which we'll validate spatially)
+  filter(countryCode %in% c("ID", "PG","MY","PH","BN","TL"))
+
+cat("After basic filtering:", nrow(mammalSEAsiaOcc1), "records remaining\n")
+
+# Step 2: CoordinateCleaner quality checks ----
+# Apply comprehensive coordinate cleaning using CoordinateCleaner
+# Note: CoordinateCleaner functions need explicit column specification when using non-default names
+
+mammalSEAsiaOcc2 <- mammalSEAsiaOcc1 %>%
+  # Create temporary species column for CoordinateCleaner (cc_dupl needs this)
+  mutate(species = if_else(!is.na(gen) & !is.na(sp), paste(gen, sp), NA_character_)) %>%
+  # Apply coordinate cleaning tests with explicit column specifications
+  cc_dupl(lon = "long", lat = "lat") %>%                    # Remove duplicate records
+  cc_zero(lon = "long", lat = "lat") %>%                    # Remove records at 0,0 coordinates  
+  cc_equ(lon = "long", lat = "lat") %>%                     # Remove records with equal lat/long
+  cc_val(lon = "long", lat = "lat") %>%                     # Remove records with invalid coordinates
+  #cc_sea(lon = "long", lat = "lat", scale = 50) %>%         # Remove marine records (scale 50 for island detail)
+  cc_cap(lon = "long", lat = "lat", buffer = 2000) %>%      # Remove records near country capitals
+  cc_cen(lon = "long", lat = "lat", buffer = 2000) %>%      # Remove records near country centroids
+  cc_gbif(lon = "long", lat = "lat", buffer = 2000) %>%     # Remove records near GBIF headquarters
+  cc_inst(lon = "long", lat = "lat", buffer = 2000) %>%     # Remove records near institutions
+  # Remove the temporary species column (we'll recreate it later for rWCVP)
+  select(-species)
+
+cat("After CoordinateCleaner filtering:", nrow(mammalSEAsiaOcc2), "records remaining\n")
+cat("Records removed by coordinate cleaning:", 
+    nrow(mammalSEAsiaOcc1) - nrow(mammalSEAsiaOcc2), "\n")
+
+# Step 2.5: Spatial filtering to study area boundaries ----
+# Remove Kew records that fall outside New Guinea and Borneo study area
+cat("Loading study area boundaries...\n")
+study_area <- st_read("territory_selection.shp")
+
+# Convert occurrence data to spatial points
+mammalSEAsiaOcc2SF <- mammalSEAsiaOcc2 %>%
+  filter(!is.na(lat), !is.na(long)) %>%
+  st_as_sf(coords = c("long", "lat"), crs = 4326)
+
+# Perform spatial intersection to keep only records within study area
+records_in_study_area <- st_intersection(mammalSEAsiaOcc2SF, study_area)
+
+# Convert back to regular dataframe and restore lat/long columns
+mammalSEAsiaOcc2_5 <- records_in_study_area %>%
+  # Extract coordinates back to columns
+  mutate(
+    long = st_coordinates(.)[,1],
+    lat = st_coordinates(.)[,2]
+  ) %>%
+  # Remove geometry column
+  st_drop_geometry()
+
+cat("After spatial filtering to study area:", nrow(mammalSEAsiaOcc2_5), "records remaining\n")
+cat("Records removed by spatial filtering:", 
+    nrow(mammalSEAsiaOcc2) - nrow(mammalSEAsiaOcc2_5), "\n")
+
+
+# Step 5: Taxonomic filtering ----
+# Filter for species-level identifications and clean uncertain identifications
+mammalSEAsiaOcc5 <- mammalSEAsiaOcc2_5 %>%
+  filter(
+    # Keep records with genus and species information
+    !is.na(gen), !is.na(sp),
+    # Remove uncertain identifications (cf., aff., sp.)
+    !grepl("\\bsp\\.?$|\\bcf\\.?\\b|\\baff\\.?\\b", sp, ignore.case = TRUE)
+    # Note: taxonRank column not available in simplified dataset
+  )
+
+cat("After taxonomic filtering:", nrow(mammalSEAsiaOcc5), "records remaining\n")
+
+cat("Geographic filtering already completed during download phase\n")
+
+# Final cleaning summary ----
+mammalSEAsiaOccData <- mammalSEAsiaOcc5
+
+cat("\n=== CLEANING SUMMARY ===\n")
+cat("Original records:", nrow(mammalSEAsiaOcc), "\n")
+cat("Final cleaned records:", nrow(mammalSEAsiaOccData), "\n")
+cat("Total removed:", nrow(mammalSEAsiaOcc) - nrow(mammalSEAsiaOccData), "\n")
+cat("Retention rate:", round(nrow(mammalSEAsiaOccData)/nrow(mammalSEAsiaOcc)*100, 1), "%\n")
+```
+
+## Plot heatmap of occurrence data
+
+```{r}
+
+
+# species and lat long data
+mammalSEAsiaCollXY <- mammalSEAsiaOccData %>%
+  select(gen, sp, long, lat) %>%
+  na.omit()
+
+mammalSEAsiaCollXY <- mammalSEAsiaCollXY |> dplyr::mutate(id = dplyr::row_number(), .before = 1)
+
+# to sf object, specifying variables with coordinates and projection
+mammalSEAsiaCollSF <- st_as_sf(mammalSEAsiaCollXY, coords = c("long", "lat"), crs = 4326) %>%
+  group_by(id) %>%
+  summarize()
+
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+malaysia <- rnaturalearth::ne_countries(country = "Malaysia", returnclass = "sf")
+
+# Keep only Sabah, Sarawak, Labuan (i.e., Malaysian Borneo)
+
+east_my <- st_crop(malaysia, c(xmin = 108, xmax = 131, ymin = -7, ymax = 8))
+
+keep_countries <- world %>%
+  filter(name %in% c("Indonesia","Brunei","Philippines","Papua New Guinea","Timor-Leste"))
+
+# Combine: target region = (selected countries) + (East Malaysia only)
+region_keep <- bind_rows(keep_countries, east_my) %>%
+  st_make_valid() %>%
+  st_union()
+
+# Your safe box (keeps Sumatra + all Philippines)
+xlim <- c(95, 156)
+ylim <- c(-10.3, 22)
+bbox <- st_bbox(c(xmin = xlim[1], xmax = xlim[2], ymin = ylim[1], ymax = ylim[2]),
+                crs = st_crs(world))
+
+regionPoly <- st_crop(region_keep, bbox)
+
+borders <- ne_download(
+  scale = "large",                                 # finer detail helps on Borneo & New Guinea
+  type = "admin_0_boundary_lines_land",
+  category = "cultural",
+  returnclass = "sf"
+) |> st_make_valid()
+
+# Clip borders to the map window (bbox) to keep things tidy
+bbox_sfc <- st_as_sfc(bbox)
+borders_clip <- suppressWarnings(st_intersection(borders, bbox_sfc))
+borders_clip <- borders_clip[st_intersects(borders_clip, regionPoly, sparse = FALSE), ]
+
+
+
+# plot points
+mammalCollPlot <-
+  ggplot() +
+  geom_sf(data = regionPoly, linewidth = 0.2) +
+  geom_sf(data = mammalSEAsiaCollSF, pch = 21) #+
+  #scale_x_continuous(breaks = c(-84)) +
+  #theme(
+    #plot.background = element_rect(fill = "#f1f2f3"),
+    #panel.background = element_rect(fill = "#2F4051"),
+    #panel.grid = element_blank(),
+    #line = element_blank(),
+    #rect = element_blank()
+  #)
+mammalCollPlot
+
+regionPoly <- regionPoly |> st_make_valid()
+
+regionGrid <- regionPoly |>
+  st_make_grid(cellsize = 0.5, what = "polygons") |>
+  st_intersection(regionPoly) |>
+  st_collection_extract("POLYGON") |>
+  st_make_valid() |>
+  st_sf() |>
+  dplyr::mutate(cellid = dplyr::row_number())
+
+gridPlot <-
+  ggplot() +
+  geom_sf(data = regionPoly) +
+  geom_sf(data = regionGrid) #+
+  #scale_x_continuous(breaks = c(-84)) +
+  #theme(
+    #plot.background = element_rect(fill = "#f1f2f3"),
+    #panel.background = element_rect(fill = "#2F4051"),
+    #panel.grid = element_blank(),
+    #line = element_blank(),
+    #rect = element_blank()
+  #)
+gridPlot
+
+mammalSEAsiaCollSF <- mammalSEAsiaCollSF |> st_make_valid()
+
+mammalCollRaster <- regionGrid |>
+  st_join(mammalSEAsiaCollSF, join = st_intersects) |>
+  dplyr::mutate(overlap = ifelse(!is.na(id), 1, 0)) |>
+  dplyr::group_by(cellid) |>
+  dplyr::summarize(numCollections = sum(overlap), .groups = "drop")
+
+# Define levels once and reuse everywhere (avoids dash/typo mismatches)
+bin_levels <- c("0","1–25","26–100","101–500","501–1000",
+                "1001–1500","1501–2000",">2000")
+
+# Bin + lock factor levels
+mammalCollRaster_binned <- mammalCollRaster %>%
+  mutate(collection_bin = cut(
+    numCollections,
+    breaks = c(-Inf, 0, 25, 100, 500, 1000, 1500, 2000, Inf),
+    labels = bin_levels,
+    include.lowest = TRUE, right = TRUE
+  )) %>%
+  mutate(collection_bin = factor(collection_bin, levels = bin_levels))
+
+# Color palette named by the same levels (note the orange for "1501–2000")
+pal <- c(
+  "0"          = "#FFFFFF",
+  "1–25"       = "#EAF2FF",
+  "26–100"     = "#D7E9FF",
+  "101–500"    = "#C3DEFF",
+  "501–1000"   = "#AECFFF",
+  "1001–1500"  = "#FFF6BF",
+  "1501–2000"  = "#FFE1B8",   # pastel orange
+  ">2000"      = "#FFB6C8"
+)
+
+mammalCollRasterPlot <-
+  ggplot() +
+  # ocean colour: panel background
+  #theme(panel.background = element_rect(fill = "grey95", colour = NA),
+        #plot.background  = element_rect(fill = "grey95", colour = NA)) +
+  # land polygons from regionPoly
+geom_sf(data = mammalCollRaster_binned, aes(fill = collection_bin), color = NA) +
+    scale_fill_manual(
+    name   = "Sample locations",
+    values = pal,
+    limits = bin_levels,   # force order & inclusion
+    drop   = FALSE,
+    guide_legend(override.aes = list(fill = pal))
+  ) +
+    geom_sf(data = regionPoly, fill = NA, colour = "grey60", linewidth = 0.2) +
+  geom_sf(data = borders_clip, color = "grey60", linewidth = 0.2) +
+  coord_sf() +
+  theme(
+    legend.position        = "inside",           # <- tell ggplot to use inside placement
+    legend.position.inside = c(0.96, 0.96),    # <- near the top-right (Pacific corner)
+    legend.justification   = c(1, 1),            # align legend's top-right to that point
+    legend.background      = element_rect(fill = NA, colour = NA),
+    legend.title = element_text(size = 9, face='bold'),
+    legend.margin          = margin(4, 4, 4, 4),
+    legend.key.width       = unit(0.4, "cm"),
+    legend.key.height      = unit(0.4, "cm")
+  )
+
+ggsave(
+  filename = "mammalDigitisedCollectionsHeatmap.svg",  # file name and extension
+  plot     = mammalCollRasterPlot,       # your ggplot object
+  width    = 8,                          # width in inches (adjust as needed)
+  height   = 6,                          # height in inches (adjust as needed)
+  units    = "in",                        # units for width/height
+  dpi      = 300                          # resolution; affects rasterized elements
+)
+
+# Digitised occurrence density per region
+
+counts <- as.data.frame(table(mammalSEAsiaOccData[[13]]))
+names(counts) <- c("Region", "Observations")
+
+# I don't know accurate these surface areas are and to what specific borders they exactly apply
+
+areas <- data.frame(
+  Region = c("Bali","Brunei","Indonesian Borneo","Indonesian Papua",
+             "Java","Lesser Sunda Islands","Malaysian Borneo","Maluku",
+             "Papua New Guinea","Phillipines","Sulawesi","Sumatra"),
+  Area_km2 = c(5590.15,5765,534698.27,412214.61,132598.77,67128.38 + 14950,
+               198445.64,78897,462840,300000,174416.16,482286.55)
+)
+
+density_table <- counts %>%
+  left_join(areas, by = "Region") %>%
+  mutate(Density = Observations / Area_km2)
+
+
+```
+
+# Birds
+
+## Download bird data
+
+```{r}
+
+
+get_gbif_credentials <- function(service_user = "jkempton001") {
+  
+  # Helper: Ensure a credential exists, else prompt to set it
+  ensure_credential <- function(service_name) {
+    existing <- tryCatch(
+      key_get(service_name, username = service_user),
+      error = function(e) NULL
+    )
+    
+    if (is.null(existing)) {
+      message(sprintf("No credential found for '%s'. Please enter it now.", service_name))
+      key_set(service_name, username = service_user)
+      existing <- key_get(service_name, username = service_user)
+    }
+    
+    return(existing)
+  }
+  
+  list(
+    user     = ensure_credential("gbif_user"),
+    password = ensure_credential("gbif_password"),
+    email    = ensure_credential("gbif_email")
+  )
+}
+
+
+# Load credentials securely
+creds <- get_gbif_credentials()
+GBIF_USER <- creds$user
+GBIF_PWD <- creds$password
+GBIF_EMAIL <- creds$email
+
+cat("GBIF credentials loaded securely from keychain\n")
+
+# Define administrative regions ----
+# Using GADM codes for precise geographic filtering
+# Note: Island-level filtering on GBIF returns inaccurate results, 
+# so we filter by administrative districts instead
+
+regions <- list(
+  amazon = c("BRA","PER","COL","ECU","BOL","VEN","GUY","SUR","GUF"),
+  congo = c("COD","COG","GAB","CMR","CAF","GNQ","AGO","RWA","BDI"),
+  indomalay = c("IDN","MYS","BRN","SGP","PHL","THA","VNM","KHM","LAO","MMR","TLS","PNG"))
+  
+
+# Create standardized download function ----
+download_gbif_occurrences <- function(region_codes, region_name) {
+  # Build predicates for the download
+  predicates <- list(
+    pred("taxonKey", 212),  # Birds
+    pred_in("basisOfRecord", c(
+      "OBSERVATION",
+      "MACHINE_OBSERVATION",
+      "HUMAN_OBSERVATION",
+      "MATERIAL_SAMPLE",
+      "MATERIAL_CITATION",
+      "PRESERVED_SPECIMEN",
+      "OCCURRENCE"
+    )),
+    pred("hasGeospatialIssue", FALSE),  # remove records with location issues
+    pred("hasCoordinate", TRUE),  # coordinates required
+    pred("occurrenceStatus", "PRESENT")  # presence records only
+  )
+  
+  # Add GADM predicates - handle both single and multiple regions
+  if (length(region_codes) == 1) {
+    predicates <- append(predicates, list(pred("gadm", region_codes)), after = 1)
+  } else {
+    # For multiple regions (like PNG mainland), add each as separate predicate
+    gadm_preds <- map(region_codes, ~pred("gadm", .x))
+    predicates <- append(predicates, list(pred_in("gadm", region_codes)), after = 1)
+  }
+  
+  # Execute download
+  download_key <- do.call(occ_download, c(
+    predicates,
+    format = "DWCA",  # Darwin Core Archive for reproducibility and citation
+    user = GBIF_USER,
+    pwd = GBIF_PWD,
+    email = GBIF_EMAIL
+  ))
+  
+  cat("Download initiated for", region_name, "- Key:", download_key, "\n")
+  return(download_key)
+}
+
+# Execute downloads for each region ----
+# Note: Each region must be downloaded separately due to rgbif limitations
+# This approach ensures precise geographic filtering for each administrative unit
+
+download_keys <- list()
+
+cat("Initiating GBIF downloads for all regions...\n")
+
+# New Guinea regions
+download_keys$amazon <- download_gbif_occurrences(regions$amazon, "Amazon")
+download_keys$congo <- download_gbif_occurrences(regions$congo, "Congo Basin")
+download_keys$indomalay <- download_gbif_occurrences(regions$indomalay, "Indo-Malay")
+
+# Check download status ----
+check_download_status <- function(download_keys) {
+  cat("\nChecking download status...\n")
+  for (region in names(download_keys)) {
+    status <- occ_download_meta(download_keys[[region]])$status
+    cat(region, ":", status, "\n")
+  }
+}
+
+# Uncomment to check status
+check_download_status(download_keys)
+```
+
+## Import data
+
+```{R}
+# Import downloaded data ----
+# Replace these with your actual download keys once downloads are complete
+download_keys <- list(
+  papua_barat = "0024334-250920141307145",
+  papua = "0024333-250920141307145", 
+  png = "0024457-250920141307145",
+  kalimantan = "0024396-250920141307145",
+  phillipines = "0024335-250920141307145",
+  sabah = "0024394-250920141307145",
+  sarawak = "0024395-250920141307145",
+  brunei = "0024387-250920141307145",
+  java = "0028378-250920141307145",
+  sumatra = "0028379-250920141307145",
+  sulawesi = "0028380-250920141307145",
+  lesser_sunda_islands = "0028510-250920141307145",
+  bali = "0028511-250920141307145",
+  maluku = "0028564-250920141307145"
+)
+
+# Function to import and process regional data
+import_and_process_region <- function(download_key, island, country) {
+  # Import data
+  data <- occ_download_get(download_key, overwrite = TRUE) %>%
+    occ_download_import(na.strings = c("", NA))
+  
+  # Select relevant columns and add geographic identifiers
+  processed_data <- data %>%
+    select(gbifID, license, institutionCode, collectionCode, occurrenceID, 
+           catalogNumber, recordNumber, recordedBy, eventDate, habitat, 
+           eventRemarks, locality, decimalLatitude, decimalLongitude, 
+           coordinateUncertaintyInMeters, coordinatePrecision, identifiedBy, 
+           scientificName, kingdom, phylum, class, order, family, genus, 
+           taxonRank, taxonomicStatus, elevation, elevationAccuracy, issue, 
+           taxonKey, acceptedTaxonKey, speciesKey, species, acceptedScientificName, 
+           verbatimScientificName, iucnRedListCategory, countryCode, 
+           individualCount, year, basisOfRecord, datasetName, establishmentMeans, 
+           references) %>%
+    # COMPREHENSIVE data type standardization - convert ALL columns to expected types
+    mutate(
+      # Convert ALL potentially problematic columns to character first, then to proper type
+      across(everything(), as.character)
+    ) %>%
+    # Now convert to proper types where needed
+    mutate(
+      # Numeric columns 
+      decimalLatitude = as.numeric(decimalLatitude),
+      decimalLongitude = as.numeric(decimalLongitude),
+      coordinateUncertaintyInMeters = as.numeric(coordinateUncertaintyInMeters),
+      coordinatePrecision = as.numeric(coordinatePrecision),
+      elevation = as.numeric(elevation),
+      elevationAccuracy = as.numeric(elevationAccuracy),
+      individualCount = as.numeric(individualCount),
+      year = as.numeric(year),
+      
+      # Keep ID columns as character (safer than bit64)
+      gbifID = as.character(gbifID),
+      taxonKey = as.character(taxonKey),
+      acceptedTaxonKey = as.character(acceptedTaxonKey),
+      speciesKey = as.character(speciesKey),
+      
+      # All other columns remain as character (including issue, license, eventDate, etc.)
+    ) %>%
+    add_column(ISLAND = island, COUNTRY = country)
+  
+  cat("Processed", island, "-", country, ":", nrow(processed_data), "records\n")
+  return(processed_data)
+}
+
+# Define island and country assignments
+region_metadata <- list(
+  papua = list(island = "New Guinea", country = "Indonesian Papua"),
+  papua_barat = list(island = "New Guinea", country = "Indonesian Papua"),
+  kalimantan = list(island = "Borneo", country = "Indonesian Borneo"),
+  brunei = list(island = "Borneo", country = "Brunei"),
+  phillipines = list(island = "Phillipines", country = "Phillipines"),
+  sabah = list(island = "Borneo", country = "Malaysian Borneo"),
+  sarawak = list(island = "Borneo", country = "Malaysian Borneo"),
+  java = list(island = "Java", country = "Java"),
+  sumatra = list(island = "Sumatra", country = "Sumatra"),
+  bali = list(island = "Bali", country = "Bali"),
+  maluku = list(island = "Maluku", country = "Maluku"),
+  sulawesi = list(island = "Sulawesi", country = "Sulawesi"),
+  lesser_sunda_islands = list(island = "Lesser Sunda Islands", country = "Lesser Sunda Islands"),
+  png = list(island = "New Guinea", country = "Papua New Guinea")
+)
+
+# Import and process all regional datasets
+cat("Importing and processing regional datasets...\n")
+
+# Process each dataset individually with error handling
+regional_datasets <- list()
+for (region_name in names(download_keys)) {
+  tryCatch({
+    regional_datasets[[region_name]] <- import_and_process_region(
+      download_keys[[region_name]], 
+      region_metadata[[region_name]]$island,
+      region_metadata[[region_name]]$country
+    )
+  }, error = function(e) {
+    cat("Error processing", region_name, ":", e$message, "\n")
+    regional_datasets[[region_name]] <<- NULL
+  })
+}
+
+# Remove any NULL entries (failed downloads)
+regional_datasets <- regional_datasets[!sapply(regional_datasets, is.null)]
+
+cat("Successfully processed", length(regional_datasets), "regional datasets\n")
+
+# Combine all regional datasets
+cat("Combining datasets from all regions...\n")
+
+# Additional safety check - examine data types before combining
+cat("Checking data types for consistency...\n")
+for (i in seq_along(regional_datasets)) {
+  region_name <- names(regional_datasets)[i]
+  cat("Dataset", i, "(", region_name, "):\n")
+  
+  # Check for problematic columns that have caused issues
+  problematic_cols <- c("issue", "license", "eventDate")
+  for (col in problematic_cols) {
+    if (col %in% names(regional_datasets[[i]])) {
+      col_type <- class(regional_datasets[[i]][[col]])[1]
+      cat("  ", col, ":", col_type, "\n")
+    }
+  }
+}
+
+# Combine datasets (should work smoothly now with standardized types)
+gbifSEAsiaBirdOccData <- bind_rows(regional_datasets)
+
+cat("Successfully combined", nrow(gbifSEAsiaBirdOccData), "records from", length(regional_datasets), "regions\n")
+
+# Optional: Check for any remaining data type issues
+cat("Data summary by column type:\n")
+gbifSEAsiaBirdOccData %>% 
+  summarise(across(everything(), ~class(.)[1])) %>% 
+  pivot_longer(everything(), names_to = "column", values_to = "type") %>%
+  count(type) %>%
+  print()
+
+# Clean and standardize GBIF data ----
+gbifSEAsiaBirdOccDataCleaned <- gbifSEAsiaBirdOccData %>%
+  # Parse accepted scientific name into components
+  # Note: Many records will only have genus, or genus + species, without authority
+  # This generates expected warnings for records missing some components
+  separate(acceptedScientificName, 
+           into = c("gen", "sp", "authority"), 
+           sep = " ", 
+           extra = "merge",
+           fill = "right") %>%  # Fill missing pieces with NA (suppresses warnings)
+  # Standardize column names to match internal dataset
+  rename(collector = recordedBy,
+         number = recordNumber,
+         lat = decimalLatitude,
+         long = decimalLongitude) %>%
+  # Select core columns for modeling PLUS geographic metadata for analyses
+  select(family, gen, sp, authority, collector, number, lat, long, 
+         countryCode, year, coordinateUncertaintyInMeters, coordinatePrecision,
+         taxonRank, ISLAND, COUNTRY)
+
+# Quick data quality check
+cat("GBIF data summary after cleaning:\n")
+cat("Total records:", nrow(gbifSEAsiaBirdOccDataCleaned), "\n")
+cat("Records with genus:", sum(!is.na(gbifSEAsiaBirdOccDataCleaned$gen)), "\n")
+cat("Records with species:", sum(!is.na(gbifSEAsiaBirdOccDataCleaned$sp)), "\n") 
+cat("Records with authority:", sum(!is.na(gbifSEAsiaBirdOccDataCleaned$authority)), "\n")
+cat("Records with coordinates:", sum(!is.na(gbifSEAsiaBirdOccDataCleaned$lat) & !is.na(gbifSEAsiaBirdOccDataCleaned$long)), "\n")
+
+
+# Summary statistics ----
+cat("Dataset summary:\n")
+cat("Total GBIF records:", nrow(gbifSEAsiaBirdOccDataCleaned), "\n")
+cat("Unique species:", gbifSEAsiaBirdOccDataCleaned %>% 
+      filter(!is.na(gen), !is.na(sp)) %>% 
+      distinct(gen, sp) %>% 
+      nrow(), "\n")
+
+# Geographic distribution summary
+cat("\nGeographic distribution:\n")
+gbifSEAsiaBirdOccDataCleaned %>% 
+  filter(!is.na(ISLAND)) %>% 
+  count(ISLAND, COUNTRY, sort = TRUE) %>%
+  print()
+
+# Preview the data structure for rWCVP workflow
+cat("\nData structure preview for rWCVP name resolution:\n")
+gbifSEAsiaBirdOccDataCleaned %>% 
+  filter(!is.na(gen), !is.na(sp)) %>%
+  select(family, gen, sp, authority, ISLAND, COUNTRY) %>%
+  slice_head(n = 5) %>%
+  print()
+
+# Generate date stamp and save cleaned dataset ----
+date_stamp <- format(Sys.Date(), "%Y%m%d")
+output_filename <- paste0("gbifSEAsiaBirdOccDataCleaned_", date_stamp, ".csv")
+
+write_csv(gbifSEAsiaBirdOccDataCleaned, output_filename)
+cat("Dataset saved as:", output_filename, "\n")
+```
+
+## Clean dataset
+
+```{r}
+# Specimen collection raster #
+
+# Load raw occurrence data ----
+# Import the combined raw dataset from GBIF download script
+cat("Loading raw occurrence data...\n")
+birdSEAsiaOcc <- read_csv("gbifSEAsiaBirdOccDataCleaned_20250930.csv")
+
+cat("Loaded dataset:", nrow(birdSEAsiaOcc), "records\n")
+#cat("Sources:", paste(unique(combined_occurrences$source), collapse = ", "), "\n")
+
+# Generate today's date stamp for output files ----
+date_stamp <- format(Sys.Date(), "%Y%m%d")
+cat("Output files will use date stamp:", date_stamp, "\n")
+
+# Initial data preparation ----
+cat("Starting data cleaning pipeline...\n")
+cat("Initial combined dataset:", nrow(birdSEAsiaOcc), "records\n")
+
+# Step 1: Basic geographic and completeness filtering ----
+birdSEAsiaOcc1 <- birdSEAsiaOcc %>%
+  # Remove records without coordinates
+  filter(!is.na(lat), !is.na(long)) %>%
+  # Filter to target countries (allowing NA for Kew data which we'll validate spatially)
+  filter(countryCode %in% c("ID", "PG","MY","PH","BN","TL"))
+
+cat("After basic filtering:", nrow(birdSEAsiaOcc1), "records remaining\n")
+
+# Step 2: CoordinateCleaner quality checks ----
+# Apply comprehensive coordinate cleaning using CoordinateCleaner
+# Note: CoordinateCleaner functions need explicit column specification when using non-default names
+
+birdSEAsiaOcc2 <- birdSEAsiaOcc1 %>%
+  # Create temporary species column for CoordinateCleaner (cc_dupl needs this)
+  mutate(species = if_else(!is.na(gen) & !is.na(sp), paste(gen, sp), NA_character_)) %>%
+  # Apply coordinate cleaning tests with explicit column specifications
+  cc_dupl(lon = "long", lat = "lat") %>%                    # Remove duplicate records
+  cc_zero(lon = "long", lat = "lat") %>%                    # Remove records at 0,0 coordinates  
+  cc_equ(lon = "long", lat = "lat") %>%                     # Remove records with equal lat/long
+  cc_val(lon = "long", lat = "lat") %>%                     # Remove records with invalid coordinates
+  #cc_sea(lon = "long", lat = "lat", scale = 50) %>%         # Remove marine records (scale 50 for island detail)
+  cc_cap(lon = "long", lat = "lat", buffer = 2000) %>%      # Remove records near country capitals
+  cc_cen(lon = "long", lat = "lat", buffer = 2000) %>%      # Remove records near country centroids
+  cc_gbif(lon = "long", lat = "lat", buffer = 2000) %>%     # Remove records near GBIF headquarters
+  cc_inst(lon = "long", lat = "lat", buffer = 2000) %>%     # Remove records near institutions
+  # Remove the temporary species column (we'll recreate it later for rWCVP)
+  select(-species)
+
+cat("After CoordinateCleaner filtering:", nrow(birdSEAsiaOcc2), "records remaining\n")
+cat("Records removed by coordinate cleaning:", 
+    nrow(birdSEAsiaOcc1) - nrow(birdSEAsiaOcc2), "\n")
+
+# Step 2.5: Spatial filtering to study area boundaries ----
+# Remove Kew records that fall outside New Guinea and Borneo study area
+cat("Loading study area boundaries...\n")
+study_area <- st_read("territory_selection.shp")
+
+# Convert occurrence data to spatial points
+birdSEAsiaOcc2SF <- birdSEAsiaOcc2 %>%
+  filter(!is.na(lat), !is.na(long)) %>%
+  st_as_sf(coords = c("long", "lat"), crs = 4326)
+
+# Perform spatial intersection to keep only records within study area
+records_in_study_area <- st_intersection(birdSEAsiaOcc2SF, study_area)
+
+# Convert back to regular dataframe and restore lat/long columns
+birdSEAsiaOcc2_5 <- records_in_study_area %>%
+  # Extract coordinates back to columns
+  mutate(
+    long = st_coordinates(.)[,1],
+    lat = st_coordinates(.)[,2]
+  ) %>%
+  # Remove geometry column
+  st_drop_geometry()
+
+cat("After spatial filtering to study area:", nrow(birdSEAsiaOcc2_5), "records remaining\n")
+cat("Records removed by spatial filtering:", 
+    nrow(birdSEAsiaOcc2) - nrow(birdSEAsiaOcc2_5), "\n")
+
+
+# Step 5: Taxonomic filtering ----
+# Filter for species-level identifications and clean uncertain identifications
+birdSEAsiaOcc5 <- birdSEAsiaOcc2_5 %>%
+  filter(
+    # Keep records with genus and species information
+    !is.na(gen), !is.na(sp),
+    # Remove uncertain identifications (cf., aff., sp.)
+    !grepl("\\bsp\\.?$|\\bcf\\.?\\b|\\baff\\.?\\b", sp, ignore.case = TRUE)
+    # Note: taxonRank column not available in simplified dataset
+  )
+
+cat("After taxonomic filtering:", nrow(birdSEAsiaOcc5), "records remaining\n")
+
+cat("Geographic filtering already completed during download phase\n")
+
+# Final cleaning summary ----
+birdSEAsiaOccData <- birdSEAsiaOcc5
+
+cat("\n=== CLEANING SUMMARY ===\n")
+cat("Original records:", nrow(birdSEAsiaOcc), "\n")
+cat("Final cleaned records:", nrow(birdSEAsiaOccData), "\n")
+cat("Total removed:", nrow(birdSEAsiaOcc) - nrow(birdSEAsiaOccData), "\n")
+cat("Retention rate:", round(nrow(birdSEAsiaOccData)/nrow(birdSEAsiaOcc)*100, 1), "%\n")
+```
+
+## Plot heatmap of occurrence data
+
+```{r}
+
+
+# species and lat long data
+birdSEAsiaCollXY <- birdSEAsiaOccData %>%
+  select(gen, sp, long, lat) %>%
+  na.omit()
+
+birdSEAsiaCollXY <- birdSEAsiaCollXY |> dplyr::mutate(id = dplyr::row_number(), .before = 1)
+
+# to sf object, specifying variables with coordinates and projection
+birdSEAsiaCollSF <- st_as_sf(birdSEAsiaCollXY, coords = c("long", "lat"), crs = 4326) %>%
+  group_by(id) %>%
+  summarize()
+
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+malaysia <- rnaturalearth::ne_countries(country = "Malaysia", returnclass = "sf")
+
+# Keep only Sabah, Sarawak, Labuan (i.e., Malaysian Borneo)
+
+east_my <- st_crop(malaysia, c(xmin = 108, xmax = 131, ymin = -7, ymax = 8))
+
+keep_countries <- world %>%
+  filter(name %in% c("Indonesia","Brunei","Philippines","Papua New Guinea","Timor-Leste"))
+
+# Combine: target region = (selected countries) + (East Malaysia only)
+region_keep <- bind_rows(keep_countries, east_my) %>%
+  st_make_valid() %>%
+  st_union()
+
+# Your safe box (keeps Sumatra + all Philippines)
+xlim <- c(95, 156)
+ylim <- c(-10.3, 22)
+bbox <- st_bbox(c(xmin = xlim[1], xmax = xlim[2], ymin = ylim[1], ymax = ylim[2]),
+                crs = st_crs(world))
+
+regionPoly <- st_crop(region_keep, bbox)
+
+borders <- ne_download(
+  scale = "large",                                 # finer detail helps on Borneo & New Guinea
+  type = "admin_0_boundary_lines_land",
+  category = "cultural",
+  returnclass = "sf"
+) |> st_make_valid()
+
+# Clip borders to the map window (bbox) to keep things tidy
+bbox_sfc <- st_as_sfc(bbox)
+borders_clip <- suppressWarnings(st_intersection(borders, bbox_sfc))
+borders_clip <- borders_clip[st_intersects(borders_clip, regionPoly, sparse = FALSE), ]
+
+
+# plot points
+birdCollPlot <-
+  ggplot() +
+  geom_sf(data = regionPoly, linewidth = 0.2) +
+  geom_sf(data = birdSEAsiaCollSF, pch = 21) #+
+  #scale_x_continuous(breaks = c(-84)) +
+  #theme(
+    #plot.background = element_rect(fill = "#f1f2f3"),
+    #panel.background = element_rect(fill = "#2F4051"),
+    #panel.grid = element_blank(),
+    #line = element_blank(),
+    #rect = element_blank()
+  #)
+birdCollPlot
+
+regionPoly <- regionPoly |> st_make_valid()
+
+regionGrid <- regionPoly |>
+  st_make_grid(cellsize = 0.5, what = "polygons") |>
+  st_intersection(regionPoly) |>
+  st_collection_extract("POLYGON") |>
+  st_make_valid() |>
+  st_sf() |>
+  dplyr::mutate(cellid = dplyr::row_number())
+
+gridPlot <-
+  ggplot() +
+  geom_sf(data = regionPoly) +
+  geom_sf(data = regionGrid) #+
+  #scale_x_continuous(breaks = c(-84)) +
+  #theme(
+    #plot.background = element_rect(fill = "#f1f2f3"),
+    #panel.background = element_rect(fill = "#2F4051"),
+    #panel.grid = element_blank(),
+    #line = element_blank(),
+    #rect = element_blank()
+  #)
+gridPlot
+
+birdSEAsiaCollSF <- birdSEAsiaCollSF |> st_make_valid()
+
+birdCollRaster <- regionGrid |>
+  st_join(birdSEAsiaCollSF, join = st_intersects) |>
+  dplyr::mutate(overlap = ifelse(!is.na(id), 1, 0)) |>
+  dplyr::group_by(cellid) |>
+  dplyr::summarize(numCollections = sum(overlap), .groups = "drop")
+
+# Define levels once and reuse everywhere (avoids dash/typo mismatches)
+bin_levels <- c("0","1–25","26–100","101–500","501–1000",
+                "1001–1500","1501–2000",">2000")
+
+# Bin + lock factor levels
+birdCollRaster_binned <- birdCollRaster %>%
+  mutate(collection_bin = cut(
+    numCollections,
+    breaks = c(-Inf, 0, 25, 100, 500, 1000, 1500, 2000, Inf),
+    labels = bin_levels,
+    include.lowest = TRUE, right = TRUE
+  )) %>%
+  mutate(collection_bin = factor(collection_bin, levels = bin_levels))
+
+# Color palette named by the same levels (note the orange for "1501–2000")
+pal <- c(
+  "0"          = "#FFFFFF",
+  "1–25"       = "#EAF2FF",
+  "26–100"     = "#D7E9FF",
+  "101–500"    = "#C3DEFF",
+  "501–1000"   = "#AECFFF",
+  "1001–1500"  = "#FFF6BF",
+  "1501–2000"  = "#FFE1B8",   # pastel orange
+  ">2000"      = "#FFB6C8"
+)
+
+birdCollRasterPlot <-
+  ggplot() +
+  # ocean colour: panel background
+  #theme(panel.background = element_rect(fill = "grey95", colour = NA),
+        #plot.background  = element_rect(fill = "grey95", colour = NA)) +
+  # land polygons from regionPoly
+geom_sf(data = birdCollRaster_binned, aes(fill = collection_bin), color = NA) +
+    scale_fill_manual(
+    name   = "Sample locations",
+    values = pal,
+    limits = bin_levels,   # force order & inclusion
+    drop   = FALSE,
+    guide_legend(override.aes = list(fill = pal))
+  ) +
+    geom_sf(data = regionPoly, fill = NA, colour = "grey60", linewidth = 0.2) +
+  geom_sf(data = borders_clip, color = "grey60", linewidth = 0.2) +
+  coord_sf() +
+  theme(
+    legend.position        = "inside",           # <- tell ggplot to use inside placement
+    legend.position.inside = c(0.96, 0.96),    # <- near the top-right (Pacific corner)
+    legend.justification   = c(1, 1),            # align legend's top-right to that point
+    legend.background      = element_rect(fill = NA, colour = NA),
+    legend.title = element_text(size = 9, face='bold'),
+    legend.margin          = margin(4, 4, 4, 4),
+    legend.key.width       = unit(0.4, "cm"),
+    legend.key.height      = unit(0.4, "cm")
+  )
+
+ggsave(
+  filename = "birdDigitisedRecordsHeatmap.svg",  # file name and extension
+  plot     = mammalCollRasterPlot,       # your ggplot object
+  width    = 8,                          # width in inches (adjust as needed)
+  height   = 6,                          # height in inches (adjust as needed)
+  units    = "in",                        # units for width/height
+  dpi      = 300                          # resolution; affects rasterized elements
+)
+
+# Digitised occurrence density per region
+
+counts <- as.data.frame(table(birdSEAsiaOccData[[13]]))
+names(counts) <- c("Region", "Observations")
+
+# I don't know accurate these surface areas are and to what specific borders they exactly apply
+
+areas <- data.frame(
+  Region = c("Bali","Brunei","Indonesian Borneo","Indonesian Papua",
+             "Java","Lesser Sunda Islands","Malaysian Borneo","Maluku",
+             "Papua New Guinea","Phillipines","Sulawesi","Sumatra"),
+  Area_km2 = c(5590.15,5765,534698.27,412214.61,132598.77,67128.38 + 14950,
+               198445.64,78897,462840,300000,174416.16,482286.55)
+)
+
+density_table <- counts %>%
+  left_join(areas, by = "Region") %>%
+  mutate(Density = Observations / Area_km2)
+
+
+```
+
+# Squamates
+
+## Download squamate data
+
+```{r}
+
+
+get_gbif_credentials <- function(service_user = "jkempton001") {
+  
+  # Helper: Ensure a credential exists, else prompt to set it
+  ensure_credential <- function(service_name) {
+    existing <- tryCatch(
+      key_get(service_name, username = service_user),
+      error = function(e) NULL
+    )
+    
+    if (is.null(existing)) {
+      message(sprintf("No credential found for '%s'. Please enter it now.", service_name))
+      key_set(service_name, username = service_user)
+      existing <- key_get(service_name, username = service_user)
+    }
+    
+    return(existing)
+  }
+  
+  list(
+    user     = ensure_credential("gbif_user"),
+    password = ensure_credential("gbif_password"),
+    email    = ensure_credential("gbif_email")
+  )
+}
+
+
+# Load credentials securely
+creds <- get_gbif_credentials()
+GBIF_USER <- creds$user
+GBIF_PWD <- creds$password
+GBIF_EMAIL <- creds$email
+
+cat("GBIF credentials loaded securely from keychain\n")
+
+# Define administrative regions ----
+# Using GADM codes for precise geographic filtering
+# Note: Island-level filtering on GBIF returns inaccurate results, 
+# so we filter by administrative districts instead
+
+regions <- list(
+  amazon = c("BRA","PER","COL","ECU","BOL","VEN","GUY","SUR","GUF"),
+  congo = c("COD","COG","GAB","CMR","CAF","GNQ","AGO","RWA","BDI"),
+  indomalay = c("IDN","MYS","BRN","SGP","PHL","THA","VNM","KHM","LAO","MMR","TLS","PNG"))
+  
+
+# Create standardized download function ----
+download_gbif_occurrences <- function(region_codes, region_name) {
+  # Build predicates for the download
+  predicates <- list(
+    pred("taxonKey", 11592253),  # Squamates
+    pred_in("basisOfRecord", c(
+      "OBSERVATION",
+      "MACHINE_OBSERVATION",
+      "HUMAN_OBSERVATION",
+      "MATERIAL_SAMPLE",
+      "MATERIAL_CITATION",
+      "PRESERVED_SPECIMEN",
+      "OCCURRENCE"
+    )),
+    pred("hasGeospatialIssue", FALSE),  # remove records with location issues
+    pred("hasCoordinate", TRUE),  # coordinates required
+    pred("occurrenceStatus", "PRESENT")  # presence records only
+  )
+  
+  # Add GADM predicates - handle both single and multiple regions
+  if (length(region_codes) == 1) {
+    predicates <- append(predicates, list(pred("gadm", region_codes)), after = 1)
+  } else {
+    # For multiple regions (like PNG mainland), add each as separate predicate
+    gadm_preds <- map(region_codes, ~pred("gadm", .x))
+    predicates <- append(predicates, list(pred_in("gadm", region_codes)), after = 1)
+  }
+  
+  # Execute download
+  download_key <- do.call(occ_download, c(
+    predicates,
+    format = "DWCA",  # Darwin Core Archive for reproducibility and citation
+    user = GBIF_USER,
+    pwd = GBIF_PWD,
+    email = GBIF_EMAIL
+  ))
+  
+  cat("Download initiated for", region_name, "- Key:", download_key, "\n")
+  return(download_key)
+}
+
+# Execute downloads for each region ----
+# Note: Each region must be downloaded separately due to rgbif limitations
+# This approach ensures precise geographic filtering for each administrative unit
+
+download_keys <- list()
+
+cat("Initiating GBIF downloads for all regions...\n")
+
+# New Guinea regions
+download_keys$amazon <- download_gbif_occurrences(regions$amazon, "Amazon")
+download_keys$congo <- download_gbif_occurrences(regions$congo, "Congo Basin")
+download_keys$indomalay <- download_gbif_occurrences(regions$indomalay, "Indo-Malay")
+
+# Check download status ----
+check_download_status <- function(download_keys) {
+  cat("\nChecking download status...\n")
+  for (region in names(download_keys)) {
+    status <- occ_download_meta(download_keys[[region]])$status
+    cat(region, ":", status, "\n")
+  }
+}
+
+# Uncomment to check status
+check_download_status(download_keys)
+```
+
+## Import data
+
+```{R}
+# Import downloaded data ----
+# Replace these with your actual download keys once downloads are complete
+download_keys <- list(
+  papua_barat = "0030972-250920141307145",
+  papua = "0030971-250920141307145", 
+  png = "0031079-250920141307145",
+  kalimantan = "0031078-250920141307145",
+  phillipines = "0030973-250920141307145",
+  sabah = "0030995-250920141307145",
+  sarawak = "0030997-250920141307145",
+  brunei = "0030992-250920141307145",
+  java = "0031084-250920141307145",
+  sumatra = "0031122-250920141307145",
+  sulawesi = "0031632-250920141307145",
+  lesser_sunda_islands = "0031183-250920141307145",
+  bali = "0031184-250920141307145",
+  maluku = "0031217-250920141307145"
+)
+
+# Function to import and process regional data
+import_and_process_region <- function(download_key, island, country) {
+  # Import data
+  data <- occ_download_get(download_key, overwrite = TRUE) %>%
+    occ_download_import(na.strings = c("", NA))
+  
+  # Select relevant columns and add geographic identifiers
+  processed_data <- data %>%
+    select(gbifID, license, institutionCode, collectionCode, occurrenceID, 
+           catalogNumber, recordNumber, recordedBy, eventDate, habitat, 
+           eventRemarks, locality, decimalLatitude, decimalLongitude, 
+           coordinateUncertaintyInMeters, coordinatePrecision, identifiedBy, 
+           scientificName, kingdom, phylum, class, order, family, genus, 
+           taxonRank, taxonomicStatus, elevation, elevationAccuracy, issue, 
+           taxonKey, acceptedTaxonKey, speciesKey, species, acceptedScientificName, 
+           verbatimScientificName, iucnRedListCategory, countryCode, 
+           individualCount, year, basisOfRecord, datasetName, establishmentMeans, 
+           references) %>%
+    # COMPREHENSIVE data type standardization - convert ALL columns to expected types
+    mutate(
+      # Convert ALL potentially problematic columns to character first, then to proper type
+      across(everything(), as.character)
+    ) %>%
+    # Now convert to proper types where needed
+    mutate(
+      # Numeric columns 
+      decimalLatitude = as.numeric(decimalLatitude),
+      decimalLongitude = as.numeric(decimalLongitude),
+      coordinateUncertaintyInMeters = as.numeric(coordinateUncertaintyInMeters),
+      coordinatePrecision = as.numeric(coordinatePrecision),
+      elevation = as.numeric(elevation),
+      elevationAccuracy = as.numeric(elevationAccuracy),
+      individualCount = as.numeric(individualCount),
+      year = as.numeric(year),
+      
+      # Keep ID columns as character (safer than bit64)
+      gbifID = as.character(gbifID),
+      taxonKey = as.character(taxonKey),
+      acceptedTaxonKey = as.character(acceptedTaxonKey),
+      speciesKey = as.character(speciesKey),
+      
+      # All other columns remain as character (including issue, license, eventDate, etc.)
+    ) %>%
+    add_column(ISLAND = island, COUNTRY = country)
+  
+  cat("Processed", island, "-", country, ":", nrow(processed_data), "records\n")
+  return(processed_data)
+}
+
+# Define island and country assignments
+region_metadata <- list(
+  papua = list(island = "New Guinea", country = "Indonesian Papua"),
+  papua_barat = list(island = "New Guinea", country = "Indonesian Papua"),
+  kalimantan = list(island = "Borneo", country = "Indonesian Borneo"),
+  brunei = list(island = "Borneo", country = "Brunei"),
+  phillipines = list(island = "Phillipines", country = "Phillipines"),
+  sabah = list(island = "Borneo", country = "Malaysian Borneo"),
+  sarawak = list(island = "Borneo", country = "Malaysian Borneo"),
+  java = list(island = "Java", country = "Java"),
+  sumatra = list(island = "Sumatra", country = "Sumatra"),
+  bali = list(island = "Bali", country = "Bali"),
+  maluku = list(island = "Maluku", country = "Maluku"),
+  sulawesi = list(island = "Sulawesi", country = "Sulawesi"),
+  lesser_sunda_islands = list(island = "Lesser Sunda Islands", country = "Lesser Sunda Islands"),
+  png = list(island = "New Guinea", country = "Papua New Guinea")
+)
+
+# Import and process all regional datasets
+cat("Importing and processing regional datasets...\n")
+
+# Process each dataset individually with error handling
+regional_datasets <- list()
+for (region_name in names(download_keys)) {
+  tryCatch({
+    regional_datasets[[region_name]] <- import_and_process_region(
+      download_keys[[region_name]], 
+      region_metadata[[region_name]]$island,
+      region_metadata[[region_name]]$country
+    )
+  }, error = function(e) {
+    cat("Error processing", region_name, ":", e$message, "\n")
+    regional_datasets[[region_name]] <<- NULL
+  })
+}
+
+# Remove any NULL entries (failed downloads)
+regional_datasets <- regional_datasets[!sapply(regional_datasets, is.null)]
+
+cat("Successfully processed", length(regional_datasets), "regional datasets\n")
+
+# Combine all regional datasets
+cat("Combining datasets from all regions...\n")
+
+# Additional safety check - examine data types before combining
+cat("Checking data types for consistency...\n")
+for (i in seq_along(regional_datasets)) {
+  region_name <- names(regional_datasets)[i]
+  cat("Dataset", i, "(", region_name, "):\n")
+  
+  # Check for problematic columns that have caused issues
+  problematic_cols <- c("issue", "license", "eventDate")
+  for (col in problematic_cols) {
+    if (col %in% names(regional_datasets[[i]])) {
+      col_type <- class(regional_datasets[[i]][[col]])[1]
+      cat("  ", col, ":", col_type, "\n")
+    }
+  }
+}
+
+# Combine datasets (should work smoothly now with standardized types)
+gbifSEAsiaSquamateOccData <- bind_rows(regional_datasets)
+
+cat("Successfully combined", nrow(gbifSEAsiaSquamateOccData), "records from", length(regional_datasets), "regions\n")
+
+# Optional: Check for any remaining data type issues
+cat("Data summary by column type:\n")
+gbifSEAsiaSquamateOccData %>% 
+  summarise(across(everything(), ~class(.)[1])) %>% 
+  pivot_longer(everything(), names_to = "column", values_to = "type") %>%
+  count(type) %>%
+  print()
+
+# Clean and standardize GBIF data ----
+gbifSEAsiaSquamateOccDataCleaned <- gbifSEAsiaSquamateOccData %>%
+  # Parse accepted scientific name into components
+  # Note: Many records will only have genus, or genus + species, without authority
+  # This generates expected warnings for records missing some components
+  separate(acceptedScientificName, 
+           into = c("gen", "sp", "authority"), 
+           sep = " ", 
+           extra = "merge",
+           fill = "right") %>%  # Fill missing pieces with NA (suppresses warnings)
+  # Standardize column names to match internal dataset
+  rename(collector = recordedBy,
+         number = recordNumber,
+         lat = decimalLatitude,
+         long = decimalLongitude) %>%
+  # Select core columns for modeling PLUS geographic metadata for analyses
+  select(family, gen, sp, authority, collector, number, lat, long, 
+         countryCode, year, coordinateUncertaintyInMeters, coordinatePrecision,
+         taxonRank, ISLAND, COUNTRY)
+
+# Quick data quality check
+cat("GBIF data summary after cleaning:\n")
+cat("Total records:", nrow(gbifSEAsiaSquamateOccDataCleaned), "\n")
+cat("Records with genus:", sum(!is.na(gbifSEAsiaSquamateOccDataCleaned$gen)), "\n")
+cat("Records with species:", sum(!is.na(gbifSEAsiaSquamateOccDataCleaned$sp)), "\n") 
+cat("Records with authority:", sum(!is.na(gbifSEAsiaSquamateOccDataCleaned$authority)), "\n")
+cat("Records with coordinates:", sum(!is.na(gbifSEAsiaSquamateOccDataCleaned$lat) & !is.na(gbifSEAsiaSquamateOccDataCleaned$long)), "\n")
+
+
+# Summary statistics ----
+cat("Dataset summary:\n")
+cat("Total GBIF records:", nrow(gbifSEAsiaSquamateOccDataCleaned), "\n")
+cat("Unique species:", gbifSEAsiaSquamateOccDataCleaned %>% 
+      filter(!is.na(gen), !is.na(sp)) %>% 
+      distinct(gen, sp) %>% 
+      nrow(), "\n")
+
+# Geographic distribution summary
+cat("\nGeographic distribution:\n")
+gbifSEAsiaSquamateOccDataCleaned %>% 
+  filter(!is.na(ISLAND)) %>% 
+  count(ISLAND, COUNTRY, sort = TRUE) %>%
+  print()
+
+# Preview the data structure for rWCVP workflow
+cat("\nData structure preview for rWCVP name resolution:\n")
+gbifSEAsiaSquamateOccDataCleaned %>% 
+  filter(!is.na(gen), !is.na(sp)) %>%
+  select(family, gen, sp, authority, ISLAND, COUNTRY) %>%
+  slice_head(n = 5) %>%
+  print()
+
+# Generate date stamp and save cleaned dataset ----
+date_stamp <- format(Sys.Date(), "%Y%m%d")
+output_filename <- paste0("gbifSEAsiaSquamateOccDataCleaned_", date_stamp, ".csv")
+
+write_csv(gbifSEAsiaSquamateOccDataCleaned, output_filename)
+cat("Dataset saved as:", output_filename, "\n")
+```
+
+## Clean dataset
+
+```{r}
+# Specimen collection raster #
+
+# Load raw occurrence data ----
+# Import the combined raw dataset from GBIF download script
+cat("Loading raw occurrence data...\n")
+squamateSEAsiaOcc <- read_csv("gbifSEAsiaSquamateOccDataCleaned_20250929.csv")
+
+cat("Loaded dataset:", nrow(squamateSEAsiaOcc), "records\n")
+#cat("Sources:", paste(unique(combined_occurrences$source), collapse = ", "), "\n")
+
+# Generate today's date stamp for output files ----
+date_stamp <- format(Sys.Date(), "%Y%m%d")
+cat("Output files will use date stamp:", date_stamp, "\n")
+
+# Initial data preparation ----
+cat("Starting data cleaning pipeline...\n")
+cat("Initial combined dataset:", nrow(squamateSEAsiaOcc), "records\n")
+
+# Step 1: Basic geographic and completeness filtering ----
+squamateSEAsiaOcc1 <- squamateSEAsiaOcc %>%
+  # Remove records without coordinates
+  filter(!is.na(lat), !is.na(long)) %>%
+  # Filter to target countries (allowing NA for Kew data which we'll validate spatially)
+  filter(countryCode %in% c("ID", "PG","MY","PH","BN","TL"))
+
+cat("After basic filtering:", nrow(squamateSEAsiaOcc1), "records remaining\n")
+
+# Step 2: CoordinateCleaner quality checks ----
+# Apply comprehensive coordinate cleaning using CoordinateCleaner
+# Note: CoordinateCleaner functions need explicit column specification when using non-default names
+
+squamateSEAsiaOcc2 <- squamateSEAsiaOcc1 %>%
+  # Create temporary species column for CoordinateCleaner (cc_dupl needs this)
+  mutate(species = if_else(!is.na(gen) & !is.na(sp), paste(gen, sp), NA_character_)) %>%
+  # Apply coordinate cleaning tests with explicit column specifications
+  cc_dupl(lon = "long", lat = "lat") %>%                    # Remove duplicate records
+  cc_zero(lon = "long", lat = "lat") %>%                    # Remove records at 0,0 coordinates  
+  cc_equ(lon = "long", lat = "lat") %>%                     # Remove records with equal lat/long
+  cc_val(lon = "long", lat = "lat") %>%                     # Remove records with invalid coordinates
+  #cc_sea(lon = "long", lat = "lat", scale = 50) %>%         # Remove marine records (scale 50 for island detail)
+  cc_cap(lon = "long", lat = "lat", buffer = 2000) %>%      # Remove records near country capitals
+  cc_cen(lon = "long", lat = "lat", buffer = 2000) %>%      # Remove records near country centroids
+  cc_gbif(lon = "long", lat = "lat", buffer = 2000) %>%     # Remove records near GBIF headquarters
+  cc_inst(lon = "long", lat = "lat", buffer = 2000) %>%     # Remove records near institutions
+  # Remove the temporary species column (we'll recreate it later for rWCVP)
+  select(-species)
+
+cat("After CoordinateCleaner filtering:", nrow(squamateSEAsiaOcc2), "records remaining\n")
+cat("Records removed by coordinate cleaning:", 
+    nrow(squamateSEAsiaOcc1) - nrow(squamateSEAsiaOcc2), "\n")
+
+# Step 2.5: Spatial filtering to study area boundaries ----
+# Remove Kew records that fall outside New Guinea and Borneo study area
+cat("Loading study area boundaries...\n")
+study_area <- st_read("territory_selection.shp")
+
+# Convert occurrence data to spatial points
+squamateSEAsiaOcc2SF <- squamateSEAsiaOcc2 %>%
+  filter(!is.na(lat), !is.na(long)) %>%
+  st_as_sf(coords = c("long", "lat"), crs = 4326)
+
+# Perform spatial intersection to keep only records within study area
+records_in_study_area <- st_intersection(squamateSEAsiaOcc2SF, study_area)
+
+# Convert back to regular dataframe and restore lat/long columns
+squamateSEAsiaOcc2_5 <- records_in_study_area %>%
+  # Extract coordinates back to columns
+  mutate(
+    long = st_coordinates(.)[,1],
+    lat = st_coordinates(.)[,2]
+  ) %>%
+  # Remove geometry column
+  st_drop_geometry()
+
+cat("After spatial filtering to study area:", nrow(squamateSEAsiaOcc2_5), "records remaining\n")
+cat("Records removed by spatial filtering:", 
+    nrow(squamateSEAsiaOcc2) - nrow(squamateSEAsiaOcc2_5), "\n")
+
+
+# Step 5: Taxonomic filtering ----
+# Filter for species-level identifications and clean uncertain identifications
+squamateSEAsiaOcc5 <- squamateSEAsiaOcc2_5 %>%
+  filter(
+    # Keep records with genus and species information
+    !is.na(gen), !is.na(sp),
+    # Remove uncertain identifications (cf., aff., sp.)
+    !grepl("\\bsp\\.?$|\\bcf\\.?\\b|\\baff\\.?\\b", sp, ignore.case = TRUE)
+    # Note: taxonRank column not available in simplified dataset
+  )
+
+cat("After taxonomic filtering:", nrow(squamateSEAsiaOcc5), "records remaining\n")
+
+cat("Geographic filtering already completed during download phase\n")
+
+# Final cleaning summary ----
+squamateSEAsiaOccData <- squamateSEAsiaOcc5
+
+cat("\n=== CLEANING SUMMARY ===\n")
+cat("Original records:", nrow(squamateSEAsiaOcc), "\n")
+cat("Final cleaned records:", nrow(squamateSEAsiaOccData), "\n")
+cat("Total removed:", nrow(squamateSEAsiaOcc) - nrow(squamateSEAsiaOccData), "\n")
+cat("Retention rate:", round(nrow(squamateSEAsiaOccData)/nrow(squamateSEAsiaOcc)*100, 1), "%\n")
+```
+
+## Plot heatmap of occurrence data
+
+```{r}
+
+
+# species and lat long data
+squamateSEAsiaCollXY <- squamateSEAsiaOccData %>%
+  select(gen, sp, long, lat) %>%
+  na.omit()
+
+squamateSEAsiaCollXY <- squamateSEAsiaCollXY |> dplyr::mutate(id = dplyr::row_number(), .before = 1)
+
+# to sf object, specifying variables with coordinates and projection
+squamateSEAsiaCollSF <- st_as_sf(squamateSEAsiaCollXY, coords = c("long", "lat"), crs = 4326) %>%
+  group_by(id) %>%
+  summarize()
+
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+malaysia <- rnaturalearth::ne_countries(country = "Malaysia", returnclass = "sf")
+
+# Keep only Sabah, Sarawak, Labuan (i.e., Malaysian Borneo)
+
+east_my <- st_crop(malaysia, c(xmin = 108, xmax = 131, ymin = -7, ymax = 8))
+
+keep_countries <- world %>%
+  filter(name %in% c("Indonesia","Brunei","Philippines","Papua New Guinea","Timor-Leste"))
+
+# Combine: target region = (selected countries) + (East Malaysia only)
+region_keep <- bind_rows(keep_countries, east_my) %>%
+  st_make_valid() %>%
+  st_union()
+
+# Your safe box (keeps Sumatra + all Philippines)
+xlim <- c(95, 156)
+ylim <- c(-10.3, 22)
+bbox <- st_bbox(c(xmin = xlim[1], xmax = xlim[2], ymin = ylim[1], ymax = ylim[2]),
+                crs = st_crs(world))
+
+regionPoly <- st_crop(region_keep, bbox)
+
+
+borders <- ne_download(
+  scale = "large",                                 # finer detail helps on Borneo & New Guinea
+  type = "admin_0_boundary_lines_land",
+  category = "cultural",
+  returnclass = "sf"
+) |> st_make_valid()
+
+# Clip borders to the map window (bbox) to keep things tidy
+bbox_sfc <- st_as_sfc(bbox)
+borders_clip <- suppressWarnings(st_intersection(borders, bbox_sfc))
+borders_clip <- borders_clip[st_intersects(borders_clip, regionPoly, sparse = FALSE), ]
+
+
+# plot points
+squamateCollPlot <-
+  ggplot() +
+  geom_sf(data = regionPoly, linewidth = 0.2) +
+  geom_sf(data = squamateSEAsiaCollSF, pch = 21) #+
+  #scale_x_continuous(breaks = c(-84)) +
+  #theme(
+    #plot.background = element_rect(fill = "#f1f2f3"),
+    #panel.background = element_rect(fill = "#2F4051"),
+    #panel.grid = element_blank(),
+    #line = element_blank(),
+    #rect = element_blank()
+  #)
+squamateCollPlot
+
+regionPoly <- regionPoly |> st_make_valid()
+
+regionGrid <- regionPoly |>
+  st_make_grid(cellsize = 0.5, what = "polygons") |>
+  st_intersection(regionPoly) |>
+  st_collection_extract("POLYGON") |>
+  st_make_valid() |>
+  st_sf() |>
+  dplyr::mutate(cellid = dplyr::row_number())
+
+gridPlot <-
+  ggplot() +
+  geom_sf(data = regionPoly) +
+  geom_sf(data = regionGrid) #+
+  #scale_x_continuous(breaks = c(-84)) +
+  #theme(
+    #plot.background = element_rect(fill = "#f1f2f3"),
+    #panel.background = element_rect(fill = "#2F4051"),
+    #panel.grid = element_blank(),
+    #line = element_blank(),
+    #rect = element_blank()
+  #)
+gridPlot
+
+squamateSEAsiaCollSF <- squamateSEAsiaCollSF |> st_make_valid()
+
+squamateCollRaster <- regionGrid |>
+  st_join(squamateSEAsiaCollSF, join = st_intersects) |>
+  dplyr::mutate(overlap = ifelse(!is.na(id), 1, 0)) |>
+  dplyr::group_by(cellid) |>
+  dplyr::summarize(numCollections = sum(overlap), .groups = "drop")
+
+# Define levels once and reuse everywhere (avoids dash/typo mismatches)
+bin_levels <- c("0","1–25","26–100","101–500","501–1000",
+                "1001–1500","1501–2000",">2000")
+
+# Bin + lock factor levels
+squamateCollRaster_binned <- squamateCollRaster %>%
+  mutate(collection_bin = cut(
+    numCollections,
+    breaks = c(-Inf, 0, 25, 100, 500, 1000, 1500, 2000, Inf),
+    labels = bin_levels,
+    include.lowest = TRUE, right = TRUE
+  )) %>%
+  mutate(collection_bin = factor(collection_bin, levels = bin_levels))
+
+# Color palette named by the same levels (note the orange for "1501–2000")
+pal <- c(
+  "0"          = "#FFFFFF",
+  "1–25"       = "#EAF2FF",
+  "26–100"     = "#D7E9FF",
+  "101–500"    = "#C3DEFF",
+  "501–1000"   = "#AECFFF",
+  "1001–1500"  = "#FFF6BF",
+  "1501–2000"  = "#FFE1B8",   # pastel orange
+  ">2000"      = "#FFB6C8"
+)
+
+squamateCollRasterPlot <-
+  ggplot() +
+  # ocean colour: panel background
+  #theme(panel.background = element_rect(fill = "grey95", colour = NA),
+        #plot.background  = element_rect(fill = "grey95", colour = NA)) +
+  # land polygons from regionPoly
+geom_sf(data = squamateCollRaster_binned, aes(fill = collection_bin), color = NA) +
+    scale_fill_manual(
+    name   = "Sample locations",
+    values = pal,
+    limits = bin_levels,   # force order & inclusion
+    drop   = FALSE,
+    guide_legend(override.aes = list(fill = pal))
+  ) +
+    geom_sf(data = regionPoly, fill = NA, colour = "grey60", linewidth = 0.2) +
+  geom_sf(data = borders_clip, color = "grey60", linewidth = 0.2) +
+  coord_sf() +
+  theme(
+    legend.position        = "inside",           # <- tell ggplot to use inside placement
+    legend.position.inside = c(0.96, 0.96),    # <- near the top-right (Pacific corner)
+    legend.justification   = c(1, 1),            # align legend's top-right to that point
+    legend.background      = element_rect(fill = NA, colour = NA),
+    legend.title = element_text(size = 9, face='bold'),
+    legend.margin          = margin(4, 4, 4, 4),
+    legend.key.width       = unit(0.4, "cm"),
+    legend.key.height      = unit(0.4, "cm")
+  )
+
+ggsave(
+  filename = "squamateDigitisedRecordsHeatmap.svg",  # file name and extension
+  plot     = squamateCollRasterPlot,       # your ggplot object
+  width    = 8,                          # width in inches (adjust as needed)
+  height   = 6,                          # height in inches (adjust as needed)
+  units    = "in",                        # units for width/height
+  dpi      = 300                          # resolution; affects rasterized elements
+)
+
+# Digitised occurrence density per region
+
+counts <- as.data.frame(table(squamateSEAsiaOccData[[13]]))
+names(counts) <- c("Region", "Observations")
+
+# I don't know accurate these surface areas are and to what specific borders they exactly apply
+
+areas <- data.frame(
+  Region = c("Bali","Brunei","Indonesian Borneo","Indonesian Papua",
+             "Java","Lesser Sunda Islands","Malaysian Borneo","Maluku",
+             "Papua New Guinea","Phillipines","Sulawesi","Sumatra"),
+  Area_km2 = c(5590.15,5765,534698.27,412214.61,132598.77,67128.38 + 14950,
+               198445.64,78897,462840,300000,174416.16,482286.55)
+)
+
+density_table <- counts %>%
+  left_join(areas, by = "Region") %>%
+  mutate(Density = Observations / Area_km2)
+
+
+```
+
+# Vascular plants
+
+## Download vascular plant data
+
+```{r}
+
+
+get_gbif_credentials <- function(service_user = "jkempton001") {
+  
+  # Helper: Ensure a credential exists, else prompt to set it
+  ensure_credential <- function(service_name) {
+    existing <- tryCatch(
+      key_get(service_name, username = service_user),
+      error = function(e) NULL
+    )
+    
+    if (is.null(existing)) {
+      message(sprintf("No credential found for '%s'. Please enter it now.", service_name))
+      key_set(service_name, username = service_user)
+      existing <- key_get(service_name, username = service_user)
+    }
+    
+    return(existing)
+  }
+  
+  list(
+    user     = ensure_credential("gbif_user"),
+    password = ensure_credential("gbif_password"),
+    email    = ensure_credential("gbif_email")
+  )
+}
+
+
+# Load credentials securely
+creds <- get_gbif_credentials()
+GBIF_USER <- creds$user
+GBIF_PWD <- creds$password
+GBIF_EMAIL <- creds$email
+
+cat("GBIF credentials loaded securely from keychain\n")
+
+# Define administrative regions ----
+# Using GADM codes for precise geographic filtering
+# Note: Island-level filtering on GBIF returns inaccurate results, 
+# so we filter by administrative districts instead
+
+regions <- list(
+  amazon = c("BRA","PER","COL","ECU","BOL","VEN","GUY","SUR","GUF"),
+  congo = c("COD","COG","GAB","CMR","CAF","GNQ","AGO","RWA","BDI"),
+  indomalay = c("IDN","MYS","BRN","SGP","PHL","THA","VNM","KHM","LAO","MMR","TLS","PNG"))
+  
+
+# Create standardized download function ----
+download_gbif_occurrences <- function(region_codes, region_name) {
+  # Build predicates for the download
+  predicates <- list(
+    pred("taxonKey", 7707728),  # Vascular plants
+    pred_in("basisOfRecord", c(
+      "OBSERVATION",
+      "MACHINE_OBSERVATION",
+      "HUMAN_OBSERVATION",
+      "MATERIAL_SAMPLE",
+      "MATERIAL_CITATION",
+      "PRESERVED_SPECIMEN",
+      "OCCURRENCE"
+    )),
+    pred("hasGeospatialIssue", FALSE),  # remove records with location issues
+    pred("hasCoordinate", TRUE),  # coordinates required
+    pred("occurrenceStatus", "PRESENT")  # presence records only
+  )
+  
+  # Add GADM predicates - handle both single and multiple regions
+  if (length(region_codes) == 1) {
+    predicates <- append(predicates, list(pred("gadm", region_codes)), after = 1)
+  } else {
+    # For multiple regions (like PNG mainland), add each as separate predicate
+    gadm_preds <- map(region_codes, ~pred("gadm", .x))
+    predicates <- append(predicates, list(pred_in("gadm", region_codes)), after = 1)
+  }
+  
+  # Execute download
+  download_key <- do.call(occ_download, c(
+    predicates,
+    format = "DWCA",  # Darwin Core Archive for reproducibility and citation
+    user = GBIF_USER,
+    pwd = GBIF_PWD,
+    email = GBIF_EMAIL
+  ))
+  
+  cat("Download initiated for", region_name, "- Key:", download_key, "\n")
+  return(download_key)
+}
+
+# Execute downloads for each region ----
+# Note: Each region must be downloaded separately due to rgbif limitations
+# This approach ensures precise geographic filtering for each administrative unit
+
+download_keys <- list()
+
+cat("Initiating GBIF downloads for all regions...\n")
+
+# New Guinea regions
+download_keys$amazon <- download_gbif_occurrences(regions$amazon, "Amazon")
+download_keys$congo <- download_gbif_occurrences(regions$congo, "Congo Basin")
+download_keys$indomalay <- download_gbif_occurrences(regions$indomalay, "Indo-Malay")
+
+# Check download status ----
+check_download_status <- function(download_keys) {
+  cat("\nChecking download status...\n")
+  for (region in names(download_keys)) {
+    status <- occ_download_meta(download_keys[[region]])$status
+    cat(region, ":", status, "\n")
+  }
+}
+
+# Uncomment to check status
+check_download_status(download_keys)
+```
+
+## Import data
+
+```{R}
+# Import downloaded data ----
+# Replace these with your actual download keys once downloads are complete
+download_keys <- list(
+  papua_barat = "0024029-250920141307145",
+  papua = "0024027-250920141307145", 
+  png = "0024057-250920141307145",
+  kalimantan = "0024055-250920141307145",
+  rest_of_indonesia = "0024056-250920141307145",
+  phillipines = "0024030-250920141307145",
+  sabah = "0024038-250920141307145",
+  sarawak = "0024039-250920141307145",
+  brunei = "0024037-250920141307145",
+  east_timor = "0024066-250920141307145"
+)
+
+# Function to import and process regional data
+import_and_process_region <- function(download_key, island, country) {
+  # Import data
+  data <- occ_download_get(download_key, overwrite = TRUE) %>%
+    occ_download_import(na.strings = c("", NA))
+  
+  # Select relevant columns and add geographic identifiers
+  processed_data <- data %>%
+    select(gbifID, license, institutionCode, collectionCode, occurrenceID, 
+           catalogNumber, recordNumber, recordedBy, eventDate, habitat, 
+           eventRemarks, locality, decimalLatitude, decimalLongitude, 
+           coordinateUncertaintyInMeters, coordinatePrecision, identifiedBy, 
+           scientificName, kingdom, phylum, class, order, family, genus, 
+           taxonRank, taxonomicStatus, elevation, elevationAccuracy, issue, 
+           taxonKey, acceptedTaxonKey, speciesKey, species, acceptedScientificName, 
+           verbatimScientificName, iucnRedListCategory, countryCode, 
+           individualCount, year, basisOfRecord, datasetName, establishmentMeans, 
+           references) %>%
+    # COMPREHENSIVE data type standardization - convert ALL columns to expected types
+    mutate(
+      # Convert ALL potentially problematic columns to character first, then to proper type
+      across(everything(), as.character)
+    ) %>%
+    # Now convert to proper types where needed
+    mutate(
+      # Numeric columns 
+      decimalLatitude = as.numeric(decimalLatitude),
+      decimalLongitude = as.numeric(decimalLongitude),
+      coordinateUncertaintyInMeters = as.numeric(coordinateUncertaintyInMeters),
+      coordinatePrecision = as.numeric(coordinatePrecision),
+      elevation = as.numeric(elevation),
+      elevationAccuracy = as.numeric(elevationAccuracy),
+      individualCount = as.numeric(individualCount),
+      year = as.numeric(year),
+      
+      # Keep ID columns as character (safer than bit64)
+      gbifID = as.character(gbifID),
+      taxonKey = as.character(taxonKey),
+      acceptedTaxonKey = as.character(acceptedTaxonKey),
+      speciesKey = as.character(speciesKey),
+      
+      # All other columns remain as character (including issue, license, eventDate, etc.)
+    ) %>%
+    add_column(ISLAND = island, COUNTRY = country)
+  
+  cat("Processed", island, "-", country, ":", nrow(processed_data), "records\n")
+  return(processed_data)
+}
+
+# Define island and country assignments
+region_metadata <- list(
+  papua = list(island = "New Guinea", country = "Indonesia"),
+  papua_barat = list(island = "New Guinea", country = "Indonesia"),
+  kalimantan = list(island = "Borneo", country = "Indonesia"),
+  brunei = list(island = "Borneo", country = "Brunei"),
+  phillipines = list(island = "Phillipines", country = "Phillipines"),
+  sabah = list(island = "Borneo", country = "Malaysia"),
+  sarawak = list(island = "Borneo", country = "Malaysia"),
+  java = list(island = "Java", country = "Indonesia"),
+  sumatra = list(island = "Sumatra", country = "Indonesia"),
+  bali = list(island = "Bali", country = "Indonesia"),
+  maluku = list(island = "Maluku", country = "Indonesia"),
+  sulawesi = list(island = "Sulawesi", country = "Indonesia"),
+  lesser_sunda_islands = list(island = "Lesser Sunda Islands", country = "Indonesia"),
+  png = list(island = "New Guinea", country = "Papua New Guinea")
+)
+
+# Import and process all regional datasets
+cat("Importing and processing regional datasets...\n")
+
+# Process each dataset individually with error handling
+regional_datasets <- list()
+for (region_name in names(download_keys)) {
+  tryCatch({
+    regional_datasets[[region_name]] <- import_and_process_region(
+      download_keys[[region_name]], 
+      region_metadata[[region_name]]$island,
+      region_metadata[[region_name]]$country
+    )
+  }, error = function(e) {
+    cat("Error processing", region_name, ":", e$message, "\n")
+    regional_datasets[[region_name]] <<- NULL
+  })
+}
+
+# Remove any NULL entries (failed downloads)
+regional_datasets <- regional_datasets[!sapply(regional_datasets, is.null)]
+
+cat("Successfully processed", length(regional_datasets), "regional datasets\n")
+
+# Combine all regional datasets
+cat("Combining datasets from all regions...\n")
+
+# Additional safety check - examine data types before combining
+cat("Checking data types for consistency...\n")
+for (i in seq_along(regional_datasets)) {
+  region_name <- names(regional_datasets)[i]
+  cat("Dataset", i, "(", region_name, "):\n")
+  
+  # Check for problematic columns that have caused issues
+  problematic_cols <- c("issue", "license", "eventDate")
+  for (col in problematic_cols) {
+    if (col %in% names(regional_datasets[[i]])) {
+      col_type <- class(regional_datasets[[i]][[col]])[1]
+      cat("  ", col, ":", col_type, "\n")
+    }
+  }
+}
+
+# Combine datasets (should work smoothly now with standardized types)
+gbifSEAsiaMammalOccData <- bind_rows(regional_datasets)
+
+cat("Successfully combined", nrow(gbifSEAsiaMammalOccData), "records from", length(regional_datasets), "regions\n")
+
+# Optional: Check for any remaining data type issues
+cat("Data summary by column type:\n")
+gbifSEAsiaMammalOccData %>% 
+  summarise(across(everything(), ~class(.)[1])) %>% 
+  pivot_longer(everything(), names_to = "column", values_to = "type") %>%
+  count(type) %>%
+  print()
+
+# Clean and standardize GBIF data ----
+gbifSEAsiaMammalOccDataCleaned <- gbifSEAsiaMammalOccData %>%
+  # Parse accepted scientific name into components
+  # Note: Many records will only have genus, or genus + species, without authority
+  # This generates expected warnings for records missing some components
+  separate(acceptedScientificName, 
+           into = c("gen", "sp", "authority"), 
+           sep = " ", 
+           extra = "merge",
+           fill = "right") %>%  # Fill missing pieces with NA (suppresses warnings)
+  # Standardize column names to match internal dataset
+  rename(collector = recordedBy,
+         number = recordNumber,
+         lat = decimalLatitude,
+         long = decimalLongitude) %>%
+  # Select core columns for modeling PLUS geographic metadata for analyses
+  select(family, gen, sp, authority, collector, number, lat, long, 
+         countryCode, year, coordinateUncertaintyInMeters, coordinatePrecision,
+         taxonRank, ISLAND, COUNTRY)
+
+# Quick data quality check
+cat("GBIF data summary after cleaning:\n")
+cat("Total records:", nrow(gbifSEAsiaMammalOccDataCleaned), "\n")
+cat("Records with genus:", sum(!is.na(gbifSEAsiaFrogsOccDataCleaned$gen)), "\n")
+cat("Records with species:", sum(!is.na(gbifSEAsiaFrogsOccDataCleaned$sp)), "\n") 
+cat("Records with authority:", sum(!is.na(gbifSEAsiaFrogsOccDataCleaned$authority)), "\n")
+cat("Records with coordinates:", sum(!is.na(gbifSEAsiaFrogsOccDataCleaned$lat) & !is.na(gbifSEAsiaFrogsOccDataCleaned$long)), "\n")
+
+
+# Summary statistics ----
+cat("Dataset summary:\n")
+cat("Total GBIF records:", nrow(gbifSEAsiaMammalOccDataCleaned), "\n")
+cat("Unique species:", gbifSEAsiaMammalOccDataCleaned %>% 
+      filter(!is.na(gen), !is.na(sp)) %>% 
+      distinct(gen, sp) %>% 
+      nrow(), "\n")
+
+# Geographic distribution summary
+cat("\nGeographic distribution:\n")
+gbifSEAsiaMammalOccDataCleaned %>% 
+  filter(!is.na(ISLAND)) %>% 
+  count(ISLAND, COUNTRY, sort = TRUE) %>%
+  print()
+
+# Preview the data structure for rWCVP workflow
+cat("\nData structure preview for rWCVP name resolution:\n")
+gbifSEAsiaMammalOccDataCleaned %>% 
+  filter(!is.na(gen), !is.na(sp)) %>%
+  select(family, gen, sp, authority, ISLAND, COUNTRY) %>%
+  slice_head(n = 5) %>%
+  print()
+
+# Generate date stamp and save cleaned dataset ----
+date_stamp <- format(Sys.Date(), "%Y%m%d")
+output_filename <- paste0("gbifSEAsiaMammalOccDataCleaned_", date_stamp, ".csv")
+
+write_csv(gbifSEAsiaMammalOccDataCleaned, output_filename)
+cat("Dataset saved as:", output_filename, "\n")
+```
+
+## Clean dataset
+
+```{r}
+# Specimen collection raster #
+
+# Load raw occurrence data ----
+# Import the combined raw dataset from GBIF download script
+cat("Loading raw occurrence data...\n")
+mammalSEAsiaOcc <- read_csv("gbifSEAsiaMammalOccDataCleaned_20250927.csv")
+
+cat("Loaded dataset:", nrow(mammalSEAsiaOcc), "records\n")
+#cat("Sources:", paste(unique(combined_occurrences$source), collapse = ", "), "\n")
+
+# Generate today's date stamp for output files ----
+date_stamp <- format(Sys.Date(), "%Y%m%d")
+cat("Output files will use date stamp:", date_stamp, "\n")
+
+# Initial data preparation ----
+cat("Starting data cleaning pipeline...\n")
+cat("Initial combined dataset:", nrow(mammalSEAsiaOcc), "records\n")
+
+# Step 1: Basic geographic and completeness filtering ----
+mammalSEAsiaOcc1 <- mammalSEAsiaOcc %>%
+  # Remove records without coordinates
+  filter(!is.na(lat), !is.na(long)) %>%
+  # Filter to target countries (allowing NA for Kew data which we'll validate spatially)
+  filter(countryCode %in% c("ID", "PG","MY","PH","BN","TL"))
+
+cat("After basic filtering:", nrow(mammalSEAsiaOcc1), "records remaining\n")
+
+# Step 2: CoordinateCleaner quality checks ----
+# Apply comprehensive coordinate cleaning using CoordinateCleaner
+# Note: CoordinateCleaner functions need explicit column specification when using non-default names
+
+mammalSEAsiaOcc2 <- mammalSEAsiaOcc1 %>%
+  # Create temporary species column for CoordinateCleaner (cc_dupl needs this)
+  mutate(species = if_else(!is.na(gen) & !is.na(sp), paste(gen, sp), NA_character_)) %>%
+  # Apply coordinate cleaning tests with explicit column specifications
+  cc_dupl(lon = "long", lat = "lat") %>%                    # Remove duplicate records
+  cc_zero(lon = "long", lat = "lat") %>%                    # Remove records at 0,0 coordinates  
+  cc_equ(lon = "long", lat = "lat") %>%                     # Remove records with equal lat/long
+  cc_val(lon = "long", lat = "lat") %>%                     # Remove records with invalid coordinates
+  #cc_sea(lon = "long", lat = "lat", scale = 50) %>%         # Remove marine records (scale 50 for island detail)
+  cc_cap(lon = "long", lat = "lat", buffer = 2000) %>%      # Remove records near country capitals
+  cc_cen(lon = "long", lat = "lat", buffer = 2000) %>%      # Remove records near country centroids
+  cc_gbif(lon = "long", lat = "lat", buffer = 2000) %>%     # Remove records near GBIF headquarters
+  cc_inst(lon = "long", lat = "lat", buffer = 2000) %>%     # Remove records near institutions
+  # Remove the temporary species column (we'll recreate it later for rWCVP)
+  select(-species)
+
+cat("After CoordinateCleaner filtering:", nrow(mammalSEAsiaOcc2), "records remaining\n")
+cat("Records removed by coordinate cleaning:", 
+    nrow(mammalSEAsiaOcc1) - nrow(mammalSEAsiaOcc2), "\n")
+
+# Step 2.5: Spatial filtering to study area boundaries ----
+# Remove Kew records that fall outside New Guinea and Borneo study area
+cat("Loading study area boundaries...\n")
+study_area <- st_read("territory_selection.shp")
+
+# Convert occurrence data to spatial points
+mammalSEAsiaOcc2SF <- mammalSEAsiaOcc2 %>%
+  filter(!is.na(lat), !is.na(long)) %>%
+  st_as_sf(coords = c("long", "lat"), crs = 4326)
+
+# Perform spatial intersection to keep only records within study area
+records_in_study_area <- st_intersection(mammalSEAsiaOcc2SF, study_area)
+
+# Convert back to regular dataframe and restore lat/long columns
+mammalSEAsiaOcc2_5 <- records_in_study_area %>%
+  # Extract coordinates back to columns
+  mutate(
+    long = st_coordinates(.)[,1],
+    lat = st_coordinates(.)[,2]
+  ) %>%
+  # Remove geometry column
+  st_drop_geometry()
+
+cat("After spatial filtering to study area:", nrow(mammalSEAsiaOcc2_5), "records remaining\n")
+cat("Records removed by spatial filtering:", 
+    nrow(mammalSEAsiaOcc2) - nrow(mammalSEAsiaOcc2_5), "\n")
+
+
+# Step 5: Taxonomic filtering ----
+# Filter for species-level identifications and clean uncertain identifications
+mammalSEAsiaOcc5 <- mammalSEAsiaOcc2_5 %>%
+  filter(
+    # Keep records with genus and species information
+    !is.na(gen), !is.na(sp),
+    # Remove uncertain identifications (cf., aff., sp.)
+    !grepl("\\bsp\\.?$|\\bcf\\.?\\b|\\baff\\.?\\b", sp, ignore.case = TRUE)
+    # Note: taxonRank column not available in simplified dataset
+  )
+
+cat("After taxonomic filtering:", nrow(mammalSEAsiaOcc5), "records remaining\n")
+
+cat("Geographic filtering already completed during download phase\n")
+
+# Final cleaning summary ----
+mammalSEAsiaOccData <- mammalSEAsiaOcc5
+
+cat("\n=== CLEANING SUMMARY ===\n")
+cat("Original records:", nrow(mammalSEAsiaOcc), "\n")
+cat("Final cleaned records:", nrow(mammalSEAsiaOccData), "\n")
+cat("Total removed:", nrow(mammalSEAsiaOcc) - nrow(mammalSEAsiaOccData), "\n")
+cat("Retention rate:", round(nrow(frogSEAsiaOccData)/nrow(mammalSEAsiaOcc)*100, 1), "%\n")
+```
+
+## Plot heatmap of occurrence data
+
+```{r}
+
+
+# species and lat long data
+mammalSEAsiaCollXY <- mammalSEAsiaOccData %>%
+  select(gen, sp, long, lat) %>%
+  na.omit()
+
+mammalSEAsiaCollXY <- mammalSEAsiaCollXY |> dplyr::mutate(id = dplyr::row_number(), .before = 1)
+
+# to sf object, specifying variables with coordinates and projection
+mammalSEAsiaCollSF <- st_as_sf(mammalSEAsiaCollXY, coords = c("long", "lat"), crs = 4326) %>%
+  group_by(id) %>%
+  summarize()
+
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+malaysia <- rnaturalearth::ne_countries(country = "Malaysia", returnclass = "sf")
+
+# Keep only Sabah, Sarawak, Labuan (i.e., Malaysian Borneo)
+
+east_my <- st_crop(malaysia, c(xmin = 108, xmax = 131, ymin = -7, ymax = 8))
+
+keep_countries <- world %>%
+  filter(name %in% c("Indonesia","Brunei","Philippines","Papua New Guinea","Timor-Leste"))
+
+# Combine: target region = (selected countries) + (East Malaysia only)
+region_keep <- bind_rows(keep_countries, east_my) %>%
+  st_make_valid() %>%
+  st_union()
+
+# Your safe box (keeps Sumatra + all Philippines)
+xlim <- c(95, 156)
+ylim <- c(-10.3, 22)
+bbox <- st_bbox(c(xmin = xlim[1], xmax = xlim[2], ymin = ylim[1], ymax = ylim[2]),
+                crs = st_crs(world))
+
+regionPoly <- st_crop(region_keep, bbox)
+
+
+# plot points
+mammalCollPlot <-
+  ggplot() +
+  geom_sf(data = regionPoly, linewidth = 0.2) +
+  geom_sf(data = mammalSEAsiaCollSF, pch = 21) #+
+  #scale_x_continuous(breaks = c(-84)) +
+  #theme(
+    #plot.background = element_rect(fill = "#f1f2f3"),
+    #panel.background = element_rect(fill = "#2F4051"),
+    #panel.grid = element_blank(),
+    #line = element_blank(),
+    #rect = element_blank()
+  #)
+mammalCollPlot
+
+regionPoly <- regionPoly |> st_make_valid()
+
+regionGrid <- regionPoly |>
+  st_make_grid(cellsize = 0.5, what = "polygons") |>
+  st_intersection(regionPoly) |>
+  st_collection_extract("POLYGON") |>
+  st_make_valid() |>
+  st_sf() |>
+  dplyr::mutate(cellid = dplyr::row_number())
+
+gridPlot <-
+  ggplot() +
+  geom_sf(data = regionPoly) +
+  geom_sf(data = regionGrid) #+
+  #scale_x_continuous(breaks = c(-84)) +
+  #theme(
+    #plot.background = element_rect(fill = "#f1f2f3"),
+    #panel.background = element_rect(fill = "#2F4051"),
+    #panel.grid = element_blank(),
+    #line = element_blank(),
+    #rect = element_blank()
+  #)
+gridPlot
+
+mammalSEAsiaCollSF <- mammalSEAsiaCollSF |> st_make_valid()
+
+mammalCollRaster <- regionGrid |>
+  st_join(mammalSEAsiaCollSF, join = st_intersects) |>
+  dplyr::mutate(overlap = ifelse(!is.na(id), 1, 0)) |>
+  dplyr::group_by(cellid) |>
+  dplyr::summarize(numCollections = sum(overlap), .groups = "drop")
+
+# Define levels once and reuse everywhere (avoids dash/typo mismatches)
+bin_levels <- c("0","1–25","26–100","101–500","501–1000",
+                "1001–1500","1501–2000",">2000")
+
+# Bin + lock factor levels
+mammalCollRaster_binned <- mammalCollRaster %>%
+  mutate(collection_bin = cut(
+    numCollections,
+    breaks = c(-Inf, 0, 25, 100, 500, 1000, 1500, 2000, Inf),
+    labels = bin_levels,
+    include.lowest = TRUE, right = TRUE
+  )) %>%
+  mutate(collection_bin = factor(collection_bin, levels = bin_levels))
+
+# Color palette named by the same levels (note the orange for "1501–2000")
+pal <- c(
+  "0"          = "#FFFFFF",
+  "1–25"       = "#EAF2FF",
+  "26–100"     = "#D7E9FF",
+  "101–500"    = "#C3DEFF",
+  "501–1000"   = "#AECFFF",
+  "1001–1500"  = "#FFF6BF",
+  "1501–2000"  = "#FFE1B8",   # pastel orange
+  ">2000"      = "#FFB6C8"
+)
+
+mammalCollRasterPlot <-
+  ggplot() +
+  # ocean colour: panel background
+  #theme(panel.background = element_rect(fill = "grey95", colour = NA),
+        #plot.background  = element_rect(fill = "grey95", colour = NA)) +
+  # land polygons from regionPoly
+geom_sf(data = mammalCollRaster_binned, aes(fill = collection_bin), color = NA) +
+    scale_fill_manual(
+    name   = "Sample locations",
+    values = pal,
+    limits = bin_levels,   # force order & inclusion
+    drop   = FALSE,
+    guide_legend(override.aes = list(fill = pal))
+  ) +
+    geom_sf(data = regionPoly, fill = NA, colour = "grey60", linewidth = 0.2) +
+  coord_sf() +
+  theme(
+    legend.position        = "inside",           # <- tell ggplot to use inside placement
+    legend.position.inside = c(0.96, 0.96),    # <- near the top-right (Pacific corner)
+    legend.justification   = c(1, 1),            # align legend's top-right to that point
+    legend.background      = element_rect(fill = NA, colour = NA),
+    legend.title = element_text(size = 9, face='bold'),
+    legend.margin          = margin(4, 4, 4, 4),
+    legend.key.width       = unit(0.4, "cm"),
+    legend.key.height      = unit(0.4, "cm")
+  )
+
+ggsave(
+  filename = "mammalSampleLocationsRasterMap.svg",  # file name and extension
+  plot     = mammalCollRasterPlot,       # your ggplot object
+  width    = 8,                          # width in inches (adjust as needed)
+  height   = 6,                          # height in inches (adjust as needed)
+  units    = "in",                        # units for width/height
+  dpi      = 300                          # resolution; affects rasterized elements
+)
+
+```
+
+# Gobies
+
+## Download goby data
+
+```{r}
+
+
+get_gbif_credentials <- function(service_user = "jkempton001") {
+  
+  # Helper: Ensure a credential exists, else prompt to set it
+  ensure_credential <- function(service_name) {
+    existing <- tryCatch(
+      key_get(service_name, username = service_user),
+      error = function(e) NULL
+    )
+    
+    if (is.null(existing)) {
+      message(sprintf("No credential found for '%s'. Please enter it now.", service_name))
+      key_set(service_name, username = service_user)
+      existing <- key_get(service_name, username = service_user)
+    }
+    
+    return(existing)
+  }
+  
+  list(
+    user     = ensure_credential("gbif_user"),
+    password = ensure_credential("gbif_password"),
+    email    = ensure_credential("gbif_email")
+  )
+}
+
+
+# Load credentials securely
+creds <- get_gbif_credentials()
+GBIF_USER <- creds$user
+GBIF_PWD <- creds$password
+GBIF_EMAIL <- creds$email
+
+cat("GBIF credentials loaded securely from keychain\n")
+
+# Define administrative regions ----
+# Using GADM codes for precise geographic filtering
+# Note: Island-level filtering on GBIF returns inaccurate results, 
+# so we filter by administrative districts instead
+
+regions <- list(
+  papua_barat = "IDN.22_1",
+  papua = "IDN.23_1",
+  kalimantan = c("IDN.12_1","IDN.13_1","IDN.14_1","IDN.34_1","IDN.35_1"),
+  sumatra = c("IDN.1_1","IDN.30_1","IDN.31_1","IDN.32_1","IDN.16_1","IDN.24_1","IDN.8_1","IDN.5_1","IDN.17_1","IDN.3_1"),
+  java = c("IDN.9_1","IDN.10_1","IDN.11_1","IDN.7_1","IDN.33_1","IDN.4_1"),
+  bali = "IDN.2_1",
+  sulawesi = c("IDN.25_1","IDN.26_1","IDN.27_1","IDN.28_1","IDN.29_1","IDN.6_1"),
+  maluku = c("IDN.18_1","IDN.19_1"),
+  lesser_sunda_islands = c("IDN.20_1","IDN.21_1","TLS"),
+  png = "PNG",
+  phillipines = "PHL",
+  brunei = "BRN",
+  sabah = "MYS.13_1",
+  sarawak = "MYS.14_1")
+  
+
+# Create standardized download function ----
+download_gbif_occurrences <- function(region_codes, region_name) {
+  # Build predicates for the download
+  predicates <- list(
+    pred("taxonKey", 4274),  # Gobies
+    pred_in("basisOfRecord", c(
+      "OBSERVATION",
+      "MACHINE_OBSERVATION",
+      "HUMAN_OBSERVATION",
+      "MATERIAL_SAMPLE",
+      "MATERIAL_CITATION",
+      "PRESERVED_SPECIMEN",
+      "OCCURRENCE"
+    )),
+    pred("hasGeospatialIssue", FALSE),  # remove records with location issues
+    pred("hasCoordinate", TRUE),  # coordinates required
+    pred("occurrenceStatus", "PRESENT")  # presence records only
+  )
+  
+  # Add GADM predicates - handle both single and multiple regions
+  if (length(region_codes) == 1) {
+    predicates <- append(predicates, list(pred("gadm", region_codes)), after = 1)
+  } else {
+    # For multiple regions (like PNG mainland), add each as separate predicate
+    gadm_preds <- map(region_codes, ~pred("gadm", .x))
+    predicates <- append(predicates, list(pred_in("gadm", region_codes)), after = 1)
+  }
+  
+  # Execute download
+  download_key <- do.call(occ_download, c(
+    predicates,
+    format = "DWCA",  # Darwin Core Archive for reproducibility and citation
+    user = GBIF_USER,
+    pwd = GBIF_PWD,
+    email = GBIF_EMAIL
+  ))
+  
+  cat("Download initiated for", region_name, "- Key:", download_key, "\n")
+  return(download_key)
+}
+
+# Execute downloads for each region ----
+# Note: Each region must be downloaded separately due to rgbif limitations
+# This approach ensures precise geographic filtering for each administrative unit
+
+download_keys <- list()
+
+cat("Initiating GBIF downloads for all regions...\n")
+
+# New Guinea regions
+download_keys$papua <- download_gbif_occurrences(regions$papua, "Papua")
+download_keys$papua_barat <- download_gbif_occurrences(regions$papua_barat, "Papua Barat")
+download_keys$phillipines <- download_gbif_occurrences(regions$phillipines, "Phillipines")
+download_keys$brunei <- download_gbif_occurrences(regions$brunei, "Brunei")
+download_keys$sabah <- download_gbif_occurrences(regions$sabah, "Sabah")
+download_keys$sarawak <- download_gbif_occurrences(regions$sarawak, "Sarawak")
+download_keys$kalimantan <- download_gbif_occurrences(regions$kalimantan, "Kalimantan")
+download_keys$png <- download_gbif_occurrences(regions$png, "PNG")
+download_keys$java <-download_gbif_occurrences(regions$java, "Java")
+download_keys$sumatra <- download_gbif_occurrences(regions$sumatra, "Sumatra")
+download_keys$sulawesi <- download_gbif_occurrences(regions$sulawesi, "Sulawesi")
+download_keys$lesser_sunda_islands <- download_gbif_occurrences(regions$lesser_sunda_islands, "Lesser Sunda Islands")
+download_keys$bali <- download_gbif_occurrences(regions$bali, "Bali")
+download_keys$maluku <- download_gbif_occurrences(regions$maluku, "Maluku")
+
+# Check download status ----
+check_download_status <- function(download_keys) {
+  cat("\nChecking download status...\n")
+  for (region in names(download_keys)) {
+    status <- occ_download_meta(download_keys[[region]])$status
+    cat(region, ":", status, "\n")
+  }
+}
+
+# Uncomment to check status
+check_download_status(download_keys)
+```
+
+## Import data
+
+```{R}
+# Import downloaded data ----
+# Replace these with your actual download keys once downloads are complete
+download_keys <- list(
+  papua_barat = "0031845-250920141307145",
+  papua = "0031844-250920141307145", 
+  png = "0031870-250920141307145",
+  kalimantan = "0031869-250920141307145",
+  phillipines = "0031846-250920141307145",
+  sabah = "0031856-250920141307145",
+  sarawak = "0031858-250920141307145",
+  brunei = "0031855-250920141307145",
+  java = "0031879-250920141307145",
+  sumatra = "0031889-250920141307145",
+  sulawesi = "0031890-250920141307145",
+  lesser_sunda_islands = "0031891-250920141307145",
+  bali = "0031898-250920141307145",
+  maluku = "0031899-250920141307145"
+)
+
+# Function to import and process regional data
+import_and_process_region <- function(download_key, island, country) {
+  # Import data
+  data <- occ_download_get(download_key, overwrite = TRUE) %>%
+    occ_download_import(na.strings = c("", NA))
+  
+  # Select relevant columns and add geographic identifiers
+  processed_data <- data %>%
+    select(gbifID, license, institutionCode, collectionCode, occurrenceID, 
+           catalogNumber, recordNumber, recordedBy, eventDate, habitat, 
+           eventRemarks, locality, decimalLatitude, decimalLongitude, 
+           coordinateUncertaintyInMeters, coordinatePrecision, identifiedBy, 
+           scientificName, kingdom, phylum, class, order, family, genus, 
+           taxonRank, taxonomicStatus, elevation, elevationAccuracy, issue, 
+           taxonKey, acceptedTaxonKey, speciesKey, species, acceptedScientificName, 
+           verbatimScientificName, iucnRedListCategory, countryCode, 
+           individualCount, year, basisOfRecord, datasetName, establishmentMeans, 
+           references) %>%
+    # COMPREHENSIVE data type standardization - convert ALL columns to expected types
+    mutate(
+      # Convert ALL potentially problematic columns to character first, then to proper type
+      across(everything(), as.character)
+    ) %>%
+    # Now convert to proper types where needed
+    mutate(
+      # Numeric columns 
+      decimalLatitude = as.numeric(decimalLatitude),
+      decimalLongitude = as.numeric(decimalLongitude),
+      coordinateUncertaintyInMeters = as.numeric(coordinateUncertaintyInMeters),
+      coordinatePrecision = as.numeric(coordinatePrecision),
+      elevation = as.numeric(elevation),
+      elevationAccuracy = as.numeric(elevationAccuracy),
+      individualCount = as.numeric(individualCount),
+      year = as.numeric(year),
+      
+      # Keep ID columns as character (safer than bit64)
+      gbifID = as.character(gbifID),
+      taxonKey = as.character(taxonKey),
+      acceptedTaxonKey = as.character(acceptedTaxonKey),
+      speciesKey = as.character(speciesKey),
+      
+      # All other columns remain as character (including issue, license, eventDate, etc.)
+    ) %>%
+    add_column(ISLAND = island, COUNTRY = country)
+  
+  cat("Processed", island, "-", country, ":", nrow(processed_data), "records\n")
+  return(processed_data)
+}
+
+# Define island and country assignments
+region_metadata <- list(
+  papua = list(island = "New Guinea", country = "Indonesian Papua"),
+  papua_barat = list(island = "New Guinea", country = "Indonesian Papua"),
+  kalimantan = list(island = "Borneo", country = "Indonesian Borneo"),
+  brunei = list(island = "Borneo", country = "Brunei"),
+  phillipines = list(island = "Phillipines", country = "Phillipines"),
+  sabah = list(island = "Borneo", country = "Malaysian Borneo"),
+  sarawak = list(island = "Borneo", country = "Malaysian Borneo"),
+  java = list(island = "Java", country = "Java"),
+  sumatra = list(island = "Sumatra", country = "Sumatra"),
+  bali = list(island = "Bali", country = "Bali"),
+  maluku = list(island = "Maluku", country = "Maluku"),
+  sulawesi = list(island = "Sulawesi", country = "Sulawesi"),
+  lesser_sunda_islands = list(island = "Lesser Sunda Islands", country = "Lesser Sunda Islands"),
+  png = list(island = "New Guinea", country = "Papua New Guinea")
+)
+
+# Import and process all regional datasets
+cat("Importing and processing regional datasets...\n")
+
+# Process each dataset individually with error handling
+regional_datasets <- list()
+for (region_name in names(download_keys)) {
+  tryCatch({
+    regional_datasets[[region_name]] <- import_and_process_region(
+      download_keys[[region_name]], 
+      region_metadata[[region_name]]$island,
+      region_metadata[[region_name]]$country
+    )
+  }, error = function(e) {
+    cat("Error processing", region_name, ":", e$message, "\n")
+    regional_datasets[[region_name]] <<- NULL
+  })
+}
+
+# Remove any NULL entries (failed downloads)
+regional_datasets <- regional_datasets[!sapply(regional_datasets, is.null)]
+
+cat("Successfully processed", length(regional_datasets), "regional datasets\n")
+
+# Combine all regional datasets
+cat("Combining datasets from all regions...\n")
+
+# Additional safety check - examine data types before combining
+cat("Checking data types for consistency...\n")
+for (i in seq_along(regional_datasets)) {
+  region_name <- names(regional_datasets)[i]
+  cat("Dataset", i, "(", region_name, "):\n")
+  
+  # Check for problematic columns that have caused issues
+  problematic_cols <- c("issue", "license", "eventDate")
+  for (col in problematic_cols) {
+    if (col %in% names(regional_datasets[[i]])) {
+      col_type <- class(regional_datasets[[i]][[col]])[1]
+      cat("  ", col, ":", col_type, "\n")
+    }
+  }
+}
+
+# Combine datasets (should work smoothly now with standardized types)
+gbifSEAsiaGobiesOccData <- bind_rows(regional_datasets)
+
+cat("Successfully combined", nrow(gbifSEAsiaGobiesOccData), "records from", length(regional_datasets), "regions\n")
+
+# Optional: Check for any remaining data type issues
+cat("Data summary by column type:\n")
+gbifSEAsiaGobiesOccData %>% 
+  summarise(across(everything(), ~class(.)[1])) %>% 
+  pivot_longer(everything(), names_to = "column", values_to = "type") %>%
+  count(type) %>%
+  print()
+
+# Clean and standardize GBIF data ----
+gbifSEAsiaGobiesOccDataCleaned <- gbifSEAsiaGobiesOccData %>%
+  # Parse accepted scientific name into components
+  # Note: Many records will only have genus, or genus + species, without authority
+  # This generates expected warnings for records missing some components
+  separate(acceptedScientificName, 
+           into = c("gen", "sp", "authority"), 
+           sep = " ", 
+           extra = "merge",
+           fill = "right") %>%  # Fill missing pieces with NA (suppresses warnings)
+  # Standardize column names to match internal dataset
+  rename(collector = recordedBy,
+         number = recordNumber,
+         lat = decimalLatitude,
+         long = decimalLongitude) %>%
+  # Select core columns for modeling PLUS geographic metadata for analyses
+  select(family, gen, sp, authority, collector, number, lat, long, 
+         countryCode, year, coordinateUncertaintyInMeters, coordinatePrecision,
+         taxonRank, ISLAND, COUNTRY)
+
+# Quick data quality check
+cat("GBIF data summary after cleaning:\n")
+cat("Total records:", nrow(gbifSEAsiaGobiesOccDataCleaned), "\n")
+cat("Records with genus:", sum(!is.na(gbifSEAsiaGobiesOccDataCleaned$gen)), "\n")
+cat("Records with species:", sum(!is.na(gbifSEAsiaGobiesOccDataCleaned$sp)), "\n") 
+cat("Records with authority:", sum(!is.na(gbifSEAsiaGobiesOccDataCleaned$authority)), "\n")
+cat("Records with coordinates:", sum(!is.na(gbifSEAsiaGobiesOccDataCleaned$lat) & !is.na(gbifSEAsiaGobiesOccDataCleaned$long)), "\n")
+
+
+# Summary statistics ----
+cat("Dataset summary:\n")
+cat("Total GBIF records:", nrow(gbifSEAsiaGobiesOccDataCleaned), "\n")
+cat("Unique species:", gbifSEAsiaGobiesOccDataCleaned %>% 
+      filter(!is.na(gen), !is.na(sp)) %>% 
+      distinct(gen, sp) %>% 
+      nrow(), "\n")
+
+# Geographic distribution summary
+cat("\nGeographic distribution:\n")
+gbifSEAsiaGobiesOccDataCleaned %>% 
+  filter(!is.na(ISLAND)) %>% 
+  count(ISLAND, COUNTRY, sort = TRUE) %>%
+  print()
+
+# Preview the data structure for rWCVP workflow
+cat("\nData structure preview for rWCVP name resolution:\n")
+gbifSEAsiaGobiesOccDataCleaned %>% 
+  filter(!is.na(gen), !is.na(sp)) %>%
+  select(family, gen, sp, authority, ISLAND, COUNTRY) %>%
+  slice_head(n = 5) %>%
+  print()
+
+# Generate date stamp and save cleaned dataset ----
+date_stamp <- format(Sys.Date(), "%Y%m%d")
+output_filename <- paste0("gbifSEAsiaGobiesOccDataCleaned_", date_stamp, ".csv")
+
+write_csv(gbifSEAsiaGobiesOccDataCleaned, output_filename)
+cat("Dataset saved as:", output_filename, "\n")
+```
+
+## Clean dataset
+
+```{r}
+# Specimen collection raster #
+
+# Load raw occurrence data ----
+# Import the combined raw dataset from GBIF download script
+cat("Loading raw occurrence data...\n")
+gobiesSEAsiaOcc <- read_csv("gbifSEAsiaGobiesOccDataCleaned_20250930.csv")
+
+cat("Loaded dataset:", nrow(gobiesSEAsiaOcc), "records\n")
+#cat("Sources:", paste(unique(combined_occurrences$source), collapse = ", "), "\n")
+
+# Generate today's date stamp for output files ----
+date_stamp <- format(Sys.Date(), "%Y%m%d")
+cat("Output files will use date stamp:", date_stamp, "\n")
+
+# Initial data preparation ----
+cat("Starting data cleaning pipeline...\n")
+cat("Initial combined dataset:", nrow(gobiesSEAsiaOcc), "records\n")
+
+# Step 1: Basic geographic and completeness filtering ----
+gobiesSEAsiaOcc1 <- gobiesSEAsiaOcc %>%
+  # Remove records without coordinates
+  filter(!is.na(lat), !is.na(long)) %>%
+  # Filter to target countries (allowing NA for Kew data which we'll validate spatially)
+  filter(countryCode %in% c("ID", "PG","MY","PH","BN","TL"))
+
+cat("After basic filtering:", nrow(gobiesSEAsiaOcc1), "records remaining\n")
+
+# Step 2: CoordinateCleaner quality checks ----
+# Apply comprehensive coordinate cleaning using CoordinateCleaner
+# Note: CoordinateCleaner functions need explicit column specification when using non-default names
+
+gobiesSEAsiaOcc2 <- gobiesSEAsiaOcc1 %>%
+  # Create temporary species column for CoordinateCleaner (cc_dupl needs this)
+  mutate(species = if_else(!is.na(gen) & !is.na(sp), paste(gen, sp), NA_character_)) %>%
+  # Apply coordinate cleaning tests with explicit column specifications
+  cc_dupl(lon = "long", lat = "lat") %>%                    # Remove duplicate records
+  cc_zero(lon = "long", lat = "lat") %>%                    # Remove records at 0,0 coordinates  
+  cc_equ(lon = "long", lat = "lat") %>%                     # Remove records with equal lat/long
+  cc_val(lon = "long", lat = "lat") %>%                     # Remove records with invalid coordinates
+  #cc_sea(lon = "long", lat = "lat", scale = 50) %>%         # Remove marine records (scale 50 for island detail)
+  cc_cap(lon = "long", lat = "lat", buffer = 2000) %>%      # Remove records near country capitals
+  cc_cen(lon = "long", lat = "lat", buffer = 2000) %>%      # Remove records near country centroids
+  cc_gbif(lon = "long", lat = "lat", buffer = 2000) %>%     # Remove records near GBIF headquarters
+  cc_inst(lon = "long", lat = "lat", buffer = 2000) %>%     # Remove records near institutions
+  # Remove the temporary species column (we'll recreate it later for rWCVP)
+  select(-species)
+
+cat("After CoordinateCleaner filtering:", nrow(gobiesSEAsiaOcc2), "records remaining\n")
+cat("Records removed by coordinate cleaning:", 
+    nrow(gobiesSEAsiaOcc1) - nrow(gobiesSEAsiaOcc2), "\n")
+
+# Step 2.5: Spatial filtering to study area boundaries ----
+# Remove Kew records that fall outside New Guinea and Borneo study area
+cat("Loading study area boundaries...\n")
+study_area <- st_read("territory_selection.shp")
+
+# Convert occurrence data to spatial points
+gobiesSEAsiaOcc2SF <- gobiesSEAsiaOcc2 %>%
+  filter(!is.na(lat), !is.na(long)) %>%
+  st_as_sf(coords = c("long", "lat"), crs = 4326)
+
+# Perform spatial intersection to keep only records within study area
+records_in_study_area <- st_intersection(gobiesSEAsiaOcc2SF, study_area)
+
+# Convert back to regular dataframe and restore lat/long columns
+gobiesSEAsiaOcc2_5 <- records_in_study_area %>%
+  # Extract coordinates back to columns
+  mutate(
+    long = st_coordinates(.)[,1],
+    lat = st_coordinates(.)[,2]
+  ) %>%
+  # Remove geometry column
+  st_drop_geometry()
+
+cat("After spatial filtering to study area:", nrow(gobiesSEAsiaOcc2_5), "records remaining\n")
+cat("Records removed by spatial filtering:", 
+    nrow(gobiesSEAsiaOcc2) - nrow(gobiesSEAsiaOcc2_5), "\n")
+
+
+# Step 5: Taxonomic filtering ----
+# Filter for species-level identifications and clean uncertain identifications
+gobiesSEAsiaOcc5 <- gobiesSEAsiaOcc2_5 %>%
+  filter(
+    # Keep records with genus and species information
+    !is.na(gen), !is.na(sp),
+    # Remove uncertain identifications (cf., aff., sp.)
+    !grepl("\\bsp\\.?$|\\bcf\\.?\\b|\\baff\\.?\\b", sp, ignore.case = TRUE)
+    # Note: taxonRank column not available in simplified dataset
+  )
+
+cat("After taxonomic filtering:", nrow(gobiesSEAsiaOcc5), "records remaining\n")
+
+cat("Geographic filtering already completed during download phase\n")
+
+# Final cleaning summary ----
+gobiesSEAsiaOccData <- gobiesSEAsiaOcc5
+
+cat("\n=== CLEANING SUMMARY ===\n")
+cat("Original records:", nrow(gobiesSEAsiaOcc), "\n")
+cat("Final cleaned records:", nrow(gobiesSEAsiaOccData), "\n")
+cat("Total removed:", nrow(gobiesSEAsiaOcc) - nrow(gobiesSEAsiaOccData), "\n")
+cat("Retention rate:", round(nrow(gobiesSEAsiaOccData)/nrow(gobiesSEAsiaOcc)*100, 1), "%\n")
+```
+
+## Plot heatmap of occurrence data
+
+```{r}
+
+
+# species and lat long data
+gobiesSEAsiaCollXY <- gobiesSEAsiaOccData %>%
+  select(gen, sp, long, lat) %>%
+  na.omit()
+
+gobiesSEAsiaCollXY <- gobiesSEAsiaCollXY |> dplyr::mutate(id = dplyr::row_number(), .before = 1)
+
+# to sf object, specifying variables with coordinates and projection
+gobiesSEAsiaCollSF <- st_as_sf(gobiesSEAsiaCollXY, coords = c("long", "lat"), crs = 4326) %>%
+  group_by(id) %>%
+  summarize()
+
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+malaysia <- rnaturalearth::ne_countries(country = "Malaysia", returnclass = "sf")
+
+# Keep only Sabah, Sarawak, Labuan (i.e., Malaysian Borneo)
+
+east_my <- st_crop(malaysia, c(xmin = 108, xmax = 131, ymin = -7, ymax = 8))
+
+keep_countries <- world %>%
+  filter(name %in% c("Indonesia","Brunei","Philippines","Papua New Guinea","Timor-Leste"))
+
+# Combine: target region = (selected countries) + (East Malaysia only)
+region_keep <- bind_rows(keep_countries, east_my) %>%
+  st_make_valid() %>%
+  st_union()
+
+# Your safe box (keeps Sumatra + all Philippines)
+xlim <- c(95, 156)
+ylim <- c(-10.3, 22)
+bbox <- st_bbox(c(xmin = xlim[1], xmax = xlim[2], ymin = ylim[1], ymax = ylim[2]),
+                crs = st_crs(world))
+
+regionPoly <- st_crop(region_keep, bbox)
+
+borders <- ne_download(
+  scale = "large",                                 # finer detail helps on Borneo & New Guinea
+  type = "admin_0_boundary_lines_land",
+  category = "cultural",
+  returnclass = "sf"
+) |> st_make_valid()
+
+# Clip borders to the map window (bbox) to keep things tidy
+bbox_sfc <- st_as_sfc(bbox)
+borders_clip <- suppressWarnings(st_intersection(borders, bbox_sfc))
+borders_clip <- borders_clip[st_intersects(borders_clip, regionPoly, sparse = FALSE), ]
+
+
+
+# plot points
+gobiesCollPlot <-
+  ggplot() +
+  geom_sf(data = regionPoly, linewidth = 0.2) +
+  geom_sf(data = gobiesSEAsiaCollSF, pch = 21) #+
+  #scale_x_continuous(breaks = c(-84)) +
+  #theme(
+    #plot.background = element_rect(fill = "#f1f2f3"),
+    #panel.background = element_rect(fill = "#2F4051"),
+    #panel.grid = element_blank(),
+    #line = element_blank(),
+    #rect = element_blank()
+  #)
+gobiesCollPlot
+
+regionPoly <- regionPoly |> st_make_valid()
+
+regionGrid <- regionPoly |>
+  st_make_grid(cellsize = 0.5, what = "polygons") |>
+  st_intersection(regionPoly) |>
+  st_collection_extract("POLYGON") |>
+  st_make_valid() |>
+  st_sf() |>
+  dplyr::mutate(cellid = dplyr::row_number())
+
+gridPlot <-
+  ggplot() +
+  geom_sf(data = regionPoly) +
+  geom_sf(data = regionGrid) #+
+  #scale_x_continuous(breaks = c(-84)) +
+  #theme(
+    #plot.background = element_rect(fill = "#f1f2f3"),
+    #panel.background = element_rect(fill = "#2F4051"),
+    #panel.grid = element_blank(),
+    #line = element_blank(),
+    #rect = element_blank()
+  #)
+gridPlot
+
+gobiesSEAsiaCollSF <- gobiesSEAsiaCollSF |> st_make_valid()
+
+gobiesCollRaster <- regionGrid |>
+  st_join(gobiesSEAsiaCollSF, join = st_intersects) |>
+  dplyr::mutate(overlap = ifelse(!is.na(id), 1, 0)) |>
+  dplyr::group_by(cellid) |>
+  dplyr::summarize(numCollections = sum(overlap), .groups = "drop")
+
+# Define levels once and reuse everywhere (avoids dash/typo mismatches)
+bin_levels <- c("0","1–25","26–100","101–500","501–1000",
+                "1001–1500","1501–2000",">2000")
+
+# Bin + lock factor levels
+gobiesCollRaster_binned <- gobiesCollRaster %>%
+  mutate(collection_bin = cut(
+    numCollections,
+    breaks = c(-Inf, 0, 25, 100, 500, 1000, 1500, 2000, Inf),
+    labels = bin_levels,
+    include.lowest = TRUE, right = TRUE
+  )) %>%
+  mutate(collection_bin = factor(collection_bin, levels = bin_levels))
+
+# Color palette named by the same levels (note the orange for "1501–2000")
+pal <- c(
+  "0"          = "#FFFFFF",
+  "1–25"       = "#EAF2FF",
+  "26–100"     = "#D7E9FF",
+  "101–500"    = "#C3DEFF",
+  "501–1000"   = "#AECFFF",
+  "1001–1500"  = "#FFF6BF",
+  "1501–2000"  = "#FFE1B8",   # pastel orange
+  ">2000"      = "#FFB6C8"
+)
+
+gobiesCollRasterPlot <-
+  ggplot() +
+  # ocean colour: panel background
+  #theme(panel.background = element_rect(fill = "grey95", colour = NA),
+        #plot.background  = element_rect(fill = "grey95", colour = NA)) +
+  # land polygons from regionPoly
+geom_sf(data = gobiesCollRaster_binned, aes(fill = collection_bin), color = NA) +
+    scale_fill_manual(
+    name   = "Sample locations",
+    values = pal,
+    limits = bin_levels,   # force order & inclusion
+    drop   = FALSE,
+    guide_legend(override.aes = list(fill = pal))
+  ) +
+    geom_sf(data = regionPoly, fill = NA, colour = "grey60", linewidth = 0.2) +
+  geom_sf(data = borders_clip, color = "grey60", linewidth = 0.2) +
+  coord_sf() +
+  theme(
+    legend.position        = "inside",           # <- tell ggplot to use inside placement
+    legend.position.inside = c(0.96, 0.96),    # <- near the top-right (Pacific corner)
+    legend.justification   = c(1, 1),            # align legend's top-right to that point
+    legend.background      = element_rect(fill = NA, colour = NA),
+    legend.title = element_text(size = 9, face='bold'),
+    legend.margin          = margin(4, 4, 4, 4),
+    legend.key.width       = unit(0.4, "cm"),
+    legend.key.height      = unit(0.4, "cm")
+  )
+
+ggsave(
+  filename = "gobyDigitisedRecordsHeatmap.svg",  # file name and extension
+  plot     = gobiesCollRasterPlot,       # your ggplot object
+  width    = 8,                          # width in inches (adjust as needed)
+  height   = 6,                          # height in inches (adjust as needed)
+  units    = "in",                        # units for width/height
+  dpi      = 300                          # resolution; affects rasterized elements
+)
+
+# Digitised occurrence density per region
+
+counts <- as.data.frame(table(gobiesSEAsiaOccData[[13]]))
+names(counts) <- c("Region", "Observations")
+
+# I don't know accurate these surface areas are and to what specific borders they exactly apply
+
+areas <- data.frame(
+  Region = c("Bali","Brunei","Indonesian Borneo","Indonesian Papua",
+             "Java","Lesser Sunda Islands","Malaysian Borneo","Maluku",
+             "Papua New Guinea","Phillipines","Sulawesi","Sumatra"),
+  Area_km2 = c(5590.15,5765,534698.27,412214.61,132598.77,67128.38 + 14950,
+               198445.64,78897,462840,300000,174416.16,482286.55)
+)
+
+density_table <- counts %>%
+  left_join(areas, by = "Region") %>%
+  mutate(Density = Observations / Area_km2)
+
+```

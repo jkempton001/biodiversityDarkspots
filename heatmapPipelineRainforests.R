@@ -657,14 +657,9 @@ run_gbif_pipeline <- function(taxon_label,
 # ============================== TAXON AND GEOGRAPHY ARGUMENTS ================#
 
 mammal_keys <- list(
-  papua_barat = "0024029-250920141307145",
-  papua       = "0024027-250920141307145",
-  png         = "0024057-250920141307145",
-  kalimantan  = "0024055-250920141307145",
-  sabah       = "0024038-250920141307145",
-  sarawak     = "0024039-250920141307145",
-  brunei      = "0024037-250920141307145",
-  madagascar  = "0025618-251009101135966"
+  amazon = "0029272-251009101135966",
+  congo       = "0029273-251009101135966",
+  indomalay         = "0029274-251009101135966"
 )
 
 frog_keys <- list(
@@ -674,39 +669,22 @@ frog_keys <- list(
 )
 
 bird_keys <- list(
-  papua_barat = "0024334-250920141307145",
-  papua = "0024333-250920141307145", 
-  png = "0024457-250920141307145",
-  kalimantan = "0024396-250920141307145",
-  sabah = "0024394-250920141307145",
-  sarawak = "0024395-250920141307145",
-  brunei = "0024387-250920141307145",
-  madagascar = "0025640-251009101135966"
+  amazon = "0029296-251009101135966",
+  congo = "0029297-251009101135966", 
+  indomalay = "0029298-251009101135966"
 )
 
 squamate_keys <- list(
-  papua_barat = "0030972-250920141307145",
-  papua = "0030971-250920141307145", 
-  png = "0031079-250920141307145",
-  kalimantan = "0031078-250920141307145",
-  sabah = "0030995-250920141307145",
-  sarawak = "0030997-250920141307145",
-  brunei = "0030992-250920141307145",
-  madagascar = "0025668-251009101135966"
+  amazon = "0029724-251009101135966",
+  congo = "0029725-251009101135966", 
+  indomalay = "0029726-251009101135966"
 )
 
 plants_keys <- list(
-  papua_barat = "0047000-250920141307145",
-  papua = "0046996-250920141307145", 
-  png = "0047318-250920141307145",
-  kalimantan = "0047131-250920141307145",
-  sabah = "0047007-250920141307145",
-  sarawak = "0047029-250920141307145",
-  brunei = "0047005-250920141307145",
-  madagascar = "0025675-251009101135966"
+  amazon = "0029766-251009101135966",
+  congo = "0029767-251009101135966", 
+  indomalay = "0029768-251009101135966"
 )
-
-
 
 
 # Frogs (Anura = 952)
@@ -761,7 +739,7 @@ plants_res <- run_gbif_pipeline(
   taxon_label = "tracheophyta",
   taxon_key   = 7707728,
   scope       = names(plants_keys),
-  study_shp_path = "NGMadBor.shp",
+  study_shp_path = "rainforestRegions.shp",
   download_keys_override = plants_keys,
   reuse_cleaned = FALSE,
   #basis_filter = c("PRESERVED_SPECIMEN")

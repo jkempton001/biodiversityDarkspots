@@ -8,35 +8,6 @@ library(CoordinateCleaner); library(countrycode); library(ggrastr); library(rgbi
 library(magrittr); library(bit64); library(keyring); library(geodata)
 library(stringr); library(tidyr); library(units)
 
-## ── Per-island map extents ─────────────────────────────────────────────────
-ISLAND_BBOX <- list(
-  "New Guinea" = c(xmin = 129, xmax = 156,  ymin = -12,  ymax = 1),
-  "Borneo"     = c(xmin = 108, xmax = 120.5, ymin =  -4.5, ymax = 7.2),
-  "Madagascar" = c(xmin =  43, xmax =  51.5, ymin = -26.5, ymax = -11)
-)
-
-
-## ── Island-split writer ────────────────────────────────────────────────────
-write_island_svgs <- function(clean_df, out_prefix, study_shp_path) {
-  islands <- c("New Guinea", "Borneo", "Madagascar")
-  ts <- format(Sys.time(), "%Y%m%d_%H%M%S")
-  purrr::walk(islands, function(isle){
-    sub <- dplyr::filter(clean_df, .data$ISLAND == isle)
-    if (nrow(sub) == 0) {
-      message("No points for ", isle, " — skipping.")
-      return(invisible(NULL))
-    }
-    rp <- make_region_poly(bbox = ISLAND_BBOX[[isle]])
-    make_heatmap(
-      sub,
-      out_prefix = paste0(out_prefix, "_", gsub("\\s+","", tolower(isle))), # suffix island name
-      region_pack = rp,
-      stamp = ts
-    )
-  })
-}
-
-
 # ── Credentials ────────────────────────────────────────────────────────────────
 get_gbif_credentials <- function(service_user = "jkempton001") {
   ensure <- function(service_name){
@@ -57,11 +28,17 @@ REGIONS <- list(
   papua_barat = "IDN.22_1",
   papua       = "IDN.23_1",
   kalimantan  = c("IDN.12_1","IDN.13_1","IDN.14_1","IDN.34_1","IDN.35_1"),
+  sumatra     = c("IDN.1_1","IDN.30_1","IDN.31_1","IDN.32_1","IDN.16_1","IDN.24_1","IDN.8_1","IDN.5_1","IDN.17_1","IDN.3_1"),
+  java        = c("IDN.9_1","IDN.10_1","IDN.11_1","IDN.7_1","IDN.33_1","IDN.4_1"),
+  bali        = "IDN.2_1",
+  sulawesi    = c("IDN.25_1","IDN.26_1","IDN.27_1","IDN.28_1","IDN.29_1","IDN.6_1"),
+  maluku      = c("IDN.18_1","IDN.19_1"),
+  lesser_sunda_islands = c("IDN.20_1","IDN.21_1","TLS"),
   png         = "PNG",
+  phillipines = "PHL",
   brunei      = "BRN",
   sabah       = "MYS.13_1",
-  sarawak     = "MYS.14_1",
-  madagascar  = "MDG"
+  sarawak     = "MYS.14_1"
 )
 
 # For tagging records with island & country labels in your outputs
@@ -70,10 +47,16 @@ REGION_META <- list(
   papua_barat = list(island="New Guinea", country="Indonesian Papua"),
   kalimantan  = list(island="Borneo", country="Indonesian Borneo"),
   brunei      = list(island="Borneo", country="Brunei"),
+  phillipines = list(island="Phillipines", country="Phillipines"),
   sabah       = list(island="Borneo", country="Malaysian Borneo"),
   sarawak     = list(island="Borneo", country="Malaysian Borneo"),
-  png         = list(island="New Guinea", country="Papua New Guinea"),
-  madagascar  = list(island = "Madagascar", country="Madagascar")
+  java        = list(island="Java", country="Java"),
+  sumatra     = list(island="Sumatra", country="Sumatra"),
+  bali        = list(island="Bali", country="Bali"),
+  maluku      = list(island="Maluku", country="Maluku"),
+  sulawesi    = list(island="Sulawesi", country="Sulawesi"),
+  lesser_sunda_islands = list(island="Lesser Sunda Islands", country="Lesser Sunda Islands"),
+  png         = list(island="New Guinea", country="Papua New Guinea")
 )
 
 # ---- helper: make a concise basisOfRecord tag for filenames ---------------
@@ -106,7 +89,7 @@ make_region_poly <- function(bbox = NULL) {
   world <- rnaturalearth::ne_countries(scale = "medium", returnclass = "sf")
   malaysia <- rnaturalearth::ne_countries(country = "Malaysia", returnclass = "sf")
   east_my <- st_crop(malaysia, c(xmin=108, xmax=131, ymin=-7, ymax=8))
-  keep <- world |> dplyr::filter(name %in% c("Indonesia","Brunei","Philippines","Papua New Guinea","Timor-Leste","Madagascar"))
+  keep <- world |> dplyr::filter(name %in% c("Indonesia","Brunei","Philippines","Papua New Guinea","Timor-Leste"))
   region_keep <- dplyr::bind_rows(keep, east_my) |> st_make_valid() |> st_union()
   
   # --- NEW: normalize bbox input ---
@@ -260,7 +243,7 @@ clean_occurrences <- function(df, study_shp_path) {
   # Basic geo filter to your study countries
   df1 <- df |>
     filter(!is.na(lat), !is.na(long)) |>
-    filter(countryCode %in% c("ID","PG","MY","PH","BN","TL","MG"))
+    filter(countryCode %in% c("ID","PG","MY","PH","BN","TL"))
   
   df2 <- df1 |>
     mutate(species = if_else(!is.na(gen) & !is.na(sp), paste(gen, sp), NA_character_)) |>
@@ -322,16 +305,8 @@ find_latest_cleaned_csv <- function(taxon_label, bor_tag = "ALLBOR", shp_tag = "
 }
 
 # 7) Grid heatmap (same styling; returns ggplot object and writes SVG)
-# 1 inch shows this many degrees (set once for all maps)
-DEG_PER_INCH <- 5  # try 4–8 depending on your preferred output size
 
-size_from_bbox <- function(bb, deg_per_in = DEG_PER_INCH) {
-  c(
-    width  = as.numeric(bb["xmax"] - bb["xmin"]) / deg_per_in,
-    height = as.numeric(bb["ymax"] - bb["ymin"]) / deg_per_in
-  )
-}
-
+# Heatmap
 
 make_heatmap <- function(clean_df, out_prefix, region_pack = make_region_poly(), cellsize = 0.5, stamp = NULL) {
   # Unpack region data prepared by make_region_poly()
@@ -463,8 +438,6 @@ make_heatmap <- function(clean_df, out_prefix, region_pack = make_region_poly(),
     )
   
   # Write SVG
-  dims <- size_from_bbox(bb)
-  
   suffix <- if (!is.null(stamp)) paste0("_", stamp) else ""
   ggsave(
     filename = paste0(out_prefix, "_heatmap", suffix, ".svg"),
@@ -474,6 +447,81 @@ make_heatmap <- function(clean_df, out_prefix, region_pack = make_region_poly(),
   # Also return the plot object for interactive sessions
   invisible(p)
 }
+
+# Pointmap
+
+make_pointmap <- function(clean_df,
+                          out_prefix,
+                          region_pack = make_region_poly(),
+                          point_size = 0.01,           # smaller default
+                          stamp = NULL) {
+  
+  regionPoly   <- region_pack$regionPoly
+  borders_clip <- region_pack$borders_clip
+  bb           <- region_pack$bbox
+  
+  # Convert into sf points
+  pts_sf <- sf::st_as_sf(
+    clean_df,
+    coords = c("long", "lat"),
+    crs = 4326
+  )
+  
+  ocean_fill   <- "grey90"      # keep ocean as-is
+  land_fill    <- "black"       # landmasses black
+  land_border  <- "black"       # or NA if you want *no* outlines
+  point_colour <- "#FFF700"     # luminous yellow (tweak if you like)
+  
+  p <- ggplot() +
+    # ocean background (whole bbox)
+    geom_sf(data = sf::st_as_sfc(bb),
+            fill = ocean_fill,
+            color = NA) +
+    
+    # landmass (black)
+    geom_sf(data = regionPoly,
+            fill = land_fill,
+            color = land_border,
+            linewidth = 0.2) +
+    
+    # country borders (optional – comment out if you want fully black land)
+    geom_sf(data = borders_clip,
+            color = land_border,
+            linewidth = 0.2) +
+    
+    # raw occurrence points as "lights"
+    geom_sf(data = pts_sf,
+            color = point_colour,
+            alpha = 0.8,        # a bit glowy, but not opaque
+            size  = point_size) +
+    
+    coord_sf(
+      xlim   = c(bb["xmin"], bb["xmax"]),
+      ylim   = c(bb["ymin"], bb["ymax"]),
+      expand = FALSE,
+      clip   = "on"
+    ) +
+    
+    theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.background = element_rect(fill = ocean_fill, colour = NA)
+    )
+  
+  suffix <- if (!is.null(stamp)) paste0("_", stamp) else ""
+  
+  ggsave(
+    filename = paste0(out_prefix, "_pointmap", suffix, ".png"),
+    plot     = p,
+    width    = 8,
+    height   = 6,
+    units    = "in",
+    dpi      = 300
+  )
+  
+  invisible(p)
+}
+
 
 # 7) Region density table (per COUNTRY by default; change to ISLAND if preferred)
 region_density <- function(clean_df, region_col = "COUNTRY") {
@@ -538,50 +586,32 @@ run_gbif_pipeline <- function(taxon_label,
   # ---------------- Reuse-cleaned branch (unchanged, but pass region_pack) ---
   if (!is.null(cleaned_csv) && file.exists(cleaned_csv)) {
     clean <- readr::read_csv(cleaned_csv, show_col_types = FALSE)
-    # OLD:
-    # rp <- make_region_poly(bbox = user_bbox)
-    # plot_obj <- make_heatmap(
-    #   clean,
-    #   out_prefix = paste0(taxon_label, "_", bor_tag, "_", shp_tag, "_digitised_occurrences"),
-    #   region_pack = rp, stamp = run_stamp
-    # )
-    
-    # NEW:
-    write_island_svgs(
-      clean_df   = clean,
+    rp <- make_region_poly(bbox = user_bbox)   # << NEW
+    plot_obj <- make_pointmap(
+      clean,
       out_prefix = paste0(taxon_label, "_", bor_tag, "_", shp_tag, "_digitised_occurrences"),
-      study_shp_path = study_shp_path
+      region_pack = rp, stamp = run_stamp
     )
-    
     dens <- region_density(clean, region_col = "COUNTRY")
     dens_out <- paste0(taxon_label, "_occurrence_density_", bor_tag, "_", shp_tag, "_", run_stamp, ".csv")
     readr::write_csv(dens, dens_out)
     return(list(download_keys = NULL, standardized = NULL, cleaned = clean,
-                heatmap = NULL, density_table = dens))
+                heatmap = plot_obj, density_table = dens))
   } else if (isTRUE(reuse_cleaned)) {
     latest <- find_latest_cleaned_csv(taxon_label, bor_tag = bor_tag, shp_tag = shp_tag)
     if (!is.null(latest)) {
       clean <- readr::read_csv(latest, show_col_types = FALSE)
-      # OLD:
-      # rp <- make_region_poly(bbox = user_bbox)
-      # plot_obj <- make_heatmap(
-      #   clean,
-      #   out_prefix = paste0(taxon_label, "_", bor_tag, "_", shp_tag, "_digitised_occurrences"),
-      #   region_pack = rp, stamp = run_stamp
-      # )
-      
-      # NEW:
-      write_island_svgs(
-        clean_df   = clean,
+      rp <- make_region_poly(bbox = user_bbox)  # << NEW
+      plot_obj <- make_pointmap(
+        clean,
         out_prefix = paste0(taxon_label, "_", bor_tag, "_", shp_tag, "_digitised_occurrences"),
-        study_shp_path = study_shp_path
+        region_pack = rp, stamp = run_stamp
       )
-      
       dens <- region_density(clean, region_col = "COUNTRY")
       dens_out <- paste0(taxon_label, "_occurrence_density_", bor_tag, "_", shp_tag, "_", run_stamp, ".csv")
       readr::write_csv(dens, dens_out)
       return(list(download_keys = NULL, standardized = NULL, cleaned = clean,
-                  heatmap = NULL, density_table = dens))
+                  heatmap = plot_obj, density_table = dens))
     }
   }
   
@@ -604,28 +634,19 @@ run_gbif_pipeline <- function(taxon_label,
   readr::write_csv(clean, clean_out)
   
   # --- Build region pack with the requested bbox and plot --------------------
-  # OLD:
-  # rp <- make_region_poly(bbox = user_bbox)
-  # plot_obj <- make_heatmap(
-  #   clean,
-  #   out_prefix = paste0(taxon_label, "_", bor_tag, "_", shp_tag, "_digitised_occurrences"),
-  #   region_pack = rp, stamp = run_stamp
-  # )
-  
-  # NEW:
-  write_island_svgs(
-    clean_df   = clean,
+  rp <- make_region_poly(bbox = user_bbox)      # << NEW
+  plot_obj <- make_pointmap(
+    clean,
     out_prefix = paste0(taxon_label, "_", bor_tag, "_", shp_tag, "_digitised_occurrences"),
-    study_shp_path = study_shp_path
+    region_pack = rp, stamp = run_stamp
   )
-  
   
   dens <- region_density(clean, region_col = "COUNTRY")
   dens_out <- paste0(taxon_label, "_occurrence_density_", bor_tag, "_", shp_tag, "_", run_stamp, ".csv")
   readr::write_csv(dens, dens_out)
   
   list(download_keys = dl_keys, standardized = std, cleaned = clean,
-       heatmap = NULL, density_table = dens)
+       heatmap = plot_obj, density_table = dens)
 }
 
 
@@ -636,10 +657,16 @@ mammal_keys <- list(
   papua       = "0024027-250920141307145",
   png         = "0024057-250920141307145",
   kalimantan  = "0024055-250920141307145",
+  phillipines = "0024030-250920141307145",
   sabah       = "0024038-250920141307145",
   sarawak     = "0024039-250920141307145",
   brunei      = "0024037-250920141307145",
-  madagascar  = "0025618-251009101135966"
+  java        = "0027224-250920141307145",
+  sumatra     = "0027225-250920141307145",
+  sulawesi    = "0027229-250920141307145",
+  lesser_sunda_islands = "0027230-250920141307145",
+  bali        = "0027231-250920141307145",
+  maluku      = "0027244-250920141307145"
 )
 
 frog_keys <- list(
@@ -647,10 +674,16 @@ frog_keys <- list(
   papua = "0020368-250920141307145", 
   png = "0022860-250920141307145",
   kalimantan = "0022979-250920141307145",
+  phillipines = "0020374-250920141307145",
   sabah = "0020403-250920141307145",
   sarawak = "0020405-250920141307145",
   brunei = "0022904-250920141307145",
-  madagascar = "0025544-251009101135966"
+  java = "0026479-250920141307145",
+  sumatra = "0026481-250920141307145",
+  bali = "0026498-250920141307145",
+  maluku = "0026509-250920141307145",
+  sulawesi = "0026482-250920141307145",
+  lesser_sunda_islands = "0026497-250920141307145"
 )
 
 bird_keys <- list(
@@ -658,10 +691,16 @@ bird_keys <- list(
   papua = "0024333-250920141307145", 
   png = "0024457-250920141307145",
   kalimantan = "0024396-250920141307145",
+  phillipines = "0024335-250920141307145",
   sabah = "0024394-250920141307145",
   sarawak = "0024395-250920141307145",
   brunei = "0024387-250920141307145",
-  madagascar = "0025640-251009101135966"
+  java = "0028378-250920141307145",
+  sumatra = "0028379-250920141307145",
+  sulawesi = "0028380-250920141307145",
+  lesser_sunda_islands = "0028510-250920141307145",
+  bali = "0028511-250920141307145",
+  maluku = "0028564-250920141307145"
 )
 
 squamate_keys <- list(
@@ -669,10 +708,16 @@ squamate_keys <- list(
   papua = "0030971-250920141307145", 
   png = "0031079-250920141307145",
   kalimantan = "0031078-250920141307145",
+  phillipines = "0030973-250920141307145",
   sabah = "0030995-250920141307145",
   sarawak = "0030997-250920141307145",
   brunei = "0030992-250920141307145",
-  madagascar = "0025668-251009101135966"
+  java = "0031084-250920141307145",
+  sumatra = "0031122-250920141307145",
+  sulawesi = "0031632-250920141307145",
+  lesser_sunda_islands = "0031183-250920141307145",
+  bali = "0031184-250920141307145",
+  maluku = "0031217-250920141307145"
 )
 
 plants_keys <- list(
@@ -680,10 +725,16 @@ plants_keys <- list(
   papua = "0046996-250920141307145", 
   png = "0047318-250920141307145",
   kalimantan = "0047131-250920141307145",
+  phillipines = "0047001-250920141307145",
   sabah = "0047007-250920141307145",
   sarawak = "0047029-250920141307145",
   brunei = "0047005-250920141307145",
-  madagascar = "0025675-251009101135966"
+  java = "0047132-250920141307145",
+  sumatra = "0047133-250920141307145",
+  sulawesi = "0047203-250920141307145",
+  lesser_sunda_islands = "0047296-250920141307145",
+  bali = "0047297-250920141307145",
+  maluku = "0047317-250920141307145"
 )
 
 
@@ -694,11 +745,11 @@ frog_res <- run_gbif_pipeline(
   taxon_label = "anura", 
   taxon_key = 952, 
   scope = names(frog_keys),
-  study_shp_path = "NGMadBor.shp",
+  study_shp_path = "indoPacificIslands.shp",
   download_keys_override = frog_keys, 
   reuse_cleaned = FALSE,
   #basis_filter = c("PRESERVED_SPECIMEN"),
-  #bbox = c(xmin = 95, xmax = 156, ymin = -10.3, ymax = 22)
+  bbox = c(xmin = 95, xmax = 156, ymin = -10.3, ymax = 22)
 )
 
 #xmin = 95, xmax = 156, ymin = -10.3, ymax = 22 - IndoPacific
@@ -708,42 +759,41 @@ mammal_res <- run_gbif_pipeline(
   taxon_label = "mammalia",
   taxon_key   = 359,
   scope       = names(mammal_keys),
-  study_shp_path = "NGMadBor.shp",
+  study_shp_path = "indoPacificIslands.shp",
   download_keys_override = mammal_keys,
   reuse_cleaned = FALSE,
   #basis_filter = c("PRESERVED_SPECIMEN")
-  #bbox = c(xmin = 95, xmax = 156, ymin = -10.3, ymax = 22)
+  bbox = c(xmin = 95, xmax = 156, ymin = -10.3, ymax = 22)
 )
 
 bird_res <- run_gbif_pipeline(
   taxon_label = "aves",
   taxon_key   = 212,
   scope       = names(bird_keys),
-  study_shp_path = "NGMadBor.shp",
+  study_shp_path = "indoPacificIslands.shp",
   download_keys_override = bird_keys,
   reuse_cleaned = FALSE,
-  #basis_filter = c("PRESERVED_SPECIMEN")
-  #bbox = c(xmin = 95, xmax = 156, ymin = -10.3, ymax = 22)
+  bbox = c(xmin = 95, xmax = 156, ymin = -10.3, ymax = 22)
 )
 
 squamates_res <- run_gbif_pipeline(
   taxon_label = "squamates",
   taxon_key   = 11592253,
   scope       = names(squamate_keys),
-  study_shp_path = "NGMadBor.shp",
+  study_shp_path = "indoPacificIslands.shp",
   download_keys_override = squamate_keys,
   reuse_cleaned = FALSE,
   #basis_filter = c("PRESERVED_SPECIMEN")
-  #bbox = c(xmin = 95, xmax = 156, ymin = -10.3, ymax = 22)
+  bbox = c(xmin = 95, xmax = 156, ymin = -10.3, ymax = 22)
 )
 
 plants_res <- run_gbif_pipeline(
   taxon_label = "tracheophyta",
   taxon_key   = 7707728,
   scope       = names(plants_keys),
-  study_shp_path = "NGMadBor.shp",
+  study_shp_path = "indoPacificIslands.shp",
   download_keys_override = plants_keys,
   reuse_cleaned = FALSE,
-  #basis_filter = c("PRESERVED_SPECIMEN")
-  #bbox = c(xmin = 95, xmax = 156, ymin = -10.3, ymax = 22)
+  basis_filter = c("PRESERVED_SPECIMEN"),
+  bbox = c(xmin = 93, xmax = 154, ymin = -12, ymax = 21)
 )

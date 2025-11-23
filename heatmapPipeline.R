@@ -405,7 +405,7 @@ make_heatmap <- function(clean_df, out_prefix, region_pack = make_region_poly(),
       values = pal,
       limits = bin_levels,
       drop   = FALSE,
-      guide  = guide_legend(override.aes = list(colour = NA))
+      guide  = "none" #guide_legend(override.aes = list(colour = NA))
     ) +
     # axes aligned with graticule
     scale_x_continuous(breaks = lon_breaks, labels = lab_lon, expand = c(0, 0)) +
@@ -670,7 +670,7 @@ frog_res <- run_gbif_pipeline(
   study_shp_path = "indoPacificIslands.shp",
   download_keys_override = frog_keys, 
   reuse_cleaned = FALSE,
-  #basis_filter = c("PRESERVED_SPECIMEN")
+  #basis_filter = c("PRESERVED_SPECIMEN"),
   bbox = c(xmin = 95, xmax = 156, ymin = -10.3, ymax = 22)
 )
 
@@ -681,11 +681,11 @@ mammal_res <- run_gbif_pipeline(
   taxon_label = "mammalia",
   taxon_key   = 359,
   scope       = names(mammal_keys),
-  study_shp_path = "PNGIDP.shp",
+  study_shp_path = "indoPacificIslands.shp",
   download_keys_override = mammal_keys,
   reuse_cleaned = FALSE,
   #basis_filter = c("PRESERVED_SPECIMEN")
-  bbox = c(xmin = 129, xmax = 156, ymin = -12, ymax = 4.5)
+  bbox = c(xmin = 95, xmax = 156, ymin = -10.3, ymax = 22)
 )
 
 bird_res <- run_gbif_pipeline(
@@ -695,7 +695,7 @@ bird_res <- run_gbif_pipeline(
   study_shp_path = "indoPacificIslands.shp",
   download_keys_override = bird_keys,
   reuse_cleaned = FALSE,
-  bbox = c(xmin = 129, xmax = 156, ymin = -12, ymax = 4.5)
+  bbox = c(xmin = 95, xmax = 156, ymin = -10.3, ymax = 22)
 )
 
 squamates_res <- run_gbif_pipeline(
@@ -713,9 +713,9 @@ plants_res <- run_gbif_pipeline(
   taxon_label = "tracheophyta",
   taxon_key   = 7707728,
   scope       = names(plants_keys),
-  study_shp_path = "PNGIDP.shp",
+  study_shp_path = "indoPacificIslands.shp",
   download_keys_override = plants_keys,
   reuse_cleaned = FALSE,
   #basis_filter = c("PRESERVED_SPECIMEN")
-  bbox = c(xmin = 129, xmax = 156, ymin = -12, ymax = 4.5)
+  bbox = c(xmin = 95, xmax = 156, ymin = -10.3, ymax = 22)
 )
