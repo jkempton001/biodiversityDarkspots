@@ -1,2 +1,2 @@
 # biodiversityDarkspots
-Repository to contain data and code associated with darkspots project. Now I'm practising how to make changes to files within the repository in RStudio, stage them, commit them, and push them to Github.
+Repository to contain data and code associated with darkspots project. Now I'm practising how to make changes to files within the repository in RStudio, stage them, commit them, and push them to Github. On 23/11/25, I have cloned my repo to a new directory on my computer as part of reinstalling git functionality on my computer -- this follows the 'upgrade' of my computer from Windows 10 to Windows 11.
